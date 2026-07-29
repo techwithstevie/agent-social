@@ -1,4 +1,7 @@
 const API_URL = import.meta.env.VITE_API_URL ?? "http://localhost:8000";
+const WS_URL = API_URL.replace(/^http/, "ws");
+
+let token = localStorage.getItem("agentsocial_access_token") ?? "";
 
 export interface User {
   id: string;
@@ -8,112 +11,77 @@ export interface User {
   organization_id: string;
 }
 
-export interface AuthResponse {
-  access_token: string;
-  token_type: string;
-  user: User;
-}
-
 export interface Agent {
   id: string;
+  organization_id: string;
   name: string;
+  handle: string;
   role: string;
-  instructions: string;
+  bio: string;
+  capabilities: string[];
   channels: string[];
-  status: string;
+  autonomy_mode: string;
+  status: "online" | "thinking" | "paused" | "offline";
+  is_public: boolean;
   created_at: string;
+  followers: number;
+  following: number;
 }
 
-export interface Campaign {
+export interface Post {
   id: string;
-  name: string;
-  objective: string;
-  audience: string;
-  brand_voice: string;
-  channels: string[];
-  status: string;
-  created_at: string;
-}
-
-export interface AgentRun {
-  id: string;
-  agent_id: string;
-  campaign_id: string;
-  topic: string;
-  channel: string;
-  status: "queued" | "running" | "completed" | "failed";
-  provider: string;
-  model: string;
-  output_json: Record<string, unknown> | null;
-  error_message: string | null;
-  started_at: string | null;
-  completed_at: string | null;
-  created_at: string;
-}
-
-export interface ContentPost {
-  id: string;
-  campaign_id: string;
-  agent_id: string;
-  agent_run_id: string;
-  title: string;
+  author_agent_id: string;
+  author_name: string;
+  author_handle: string;
+  author_role: string;
+  post_type: string;
   body: string;
-  channel: string;
-  hashtags: string[];
-  risk_flags: string[];
-  risk_score: number;
   status: string;
-  approved_at: string | null;
-  published_at: string | null;
-  publish_response: Record<string, unknown> | null;
+  visibility: string;
+  source: string;
+  provenance: Record<string, unknown>;
   created_at: string;
+  reaction_count: number;
+  comment_count: number;
+  viewer_reaction: string | null;
 }
 
-export interface AuditEvent {
+export interface Comment {
   id: string;
-  actor_type: string;
-  action: string;
-  resource_type: string;
-  resource_id: string;
-  detail: Record<string, unknown>;
+  post_id: string;
+  user_name: string;
+  body: string;
   created_at: string;
 }
 
 export interface Dashboard {
-  active_campaigns: number;
-  awaiting_review: number;
-  approved_ready: number;
-  published: number;
-  total_runs: number;
-  provider: string;
+  owned_agents: number;
+  online_agents: number;
+  drafts_waiting: number;
+  published_posts: number;
+  total_followers: number;
 }
 
-let token = localStorage.getItem("agentsocial_access_token") ?? "";
-
-function headers(extra: HeadersInit = {}) {
-  return {
-    "Content-Type": "application/json",
-    ...(token ? { Authorization: `Bearer ${token}` } : {}),
-    ...extra,
-  };
-}
-
-async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
-  const response = await fetch(`${API_URL}${path}`, {
+function request<T>(path: string, options: RequestInit = {}): Promise<T> {
+  return fetch(`${API_URL}${path}`, {
     ...options,
-    headers: headers(options.headers),
+    headers: {
+      "Content-Type": "application/json",
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      ...options.headers,
+    },
+  }).then(async (response) => {
+    if (!response.ok) {
+      const body = await response.json().catch(() => null);
+      throw new Error(body?.detail ?? "Request failed.");
+    }
+
+    return response.json() as Promise<T>;
   });
-
-  if (!response.ok) {
-    const body = await response.json().catch(() => null);
-    throw new Error(body?.detail ?? "Request failed.");
-  }
-
-  return response.json() as Promise<T>;
 }
 
 export const auth = {
-  isLoggedIn: () => Boolean(token),
+  loggedIn: () => Boolean(token),
 
   logout() {
     token = "";
@@ -121,10 +89,11 @@ export const auth = {
   },
 
   async login(email: string, password: string) {
-    const result = await request<AuthResponse>("/api/auth/login", {
+    const result = await request<{ access_token: string; user: User }>("/api/auth/login", {
       method: "POST",
       body: JSON.stringify({ email, password }),
     });
+
     token = result.access_token;
     localStorage.setItem("agentsocial_access_token", token);
     return result;
@@ -136,10 +105,11 @@ export const auth = {
     email: string;
     password: string;
   }) {
-    const result = await request<AuthResponse>("/api/auth/register", {
+    const result = await request<{ access_token: string; user: User }>("/api/auth/register", {
       method: "POST",
       body: JSON.stringify(payload),
     });
+
     token = result.access_token;
     localStorage.setItem("agentsocial_access_token", token);
     return result;
@@ -149,48 +119,87 @@ export const auth = {
 export const api = {
   me: () => request<User>("/api/me"),
   dashboard: () => request<Dashboard>("/api/dashboard"),
-  agents: () => request<Agent[]>("/api/agents"),
-  campaigns: () => request<Campaign[]>("/api/campaigns"),
-  posts: () => request<ContentPost[]>("/api/posts"),
-  audit: () => request<AuditEvent[]>("/api/audit"),
+  agents: (mineOnly = false) => request<Agent[]>(`/api/agents?mine_only=${mineOnly}`),
+  feed: (mode = "network") => request<Post[]>(`/api/feed?mode=${mode}`),
+  reviewPosts: () => request<Post[]>("/api/posts/review"),
+  audit: () => request<any[]>("/api/audit"),
+  comments: (postId: string) => request<Comment[]>(`/api/posts/${postId}/comments`),
 
-  createAgent: (payload: Omit<Agent, "id" | "status" | "created_at">) =>
+  createAgent: (payload: {
+    name: string;
+    handle: string;
+    role: string;
+    bio: string;
+    capabilities: string[];
+    channels: string[];
+    autonomy_mode: string;
+    is_public: boolean;
+  }) =>
     request<Agent>("/api/agents", {
       method: "POST",
       body: JSON.stringify(payload),
     }),
 
-  createCampaign: (payload: Omit<Campaign, "id" | "status" | "created_at">) =>
-    request<Campaign>("/api/campaigns", {
-      method: "POST",
-      body: JSON.stringify(payload),
+  updateAgentStatus: (agentId: string, status: string) =>
+    request<Agent>(`/api/agents/${agentId}/status`, {
+      method: "PATCH",
+      body: JSON.stringify({ status }),
     }),
 
-  createRun: (payload: {
-    agent_id: string;
-    campaign_id: string;
-    topic: string;
-    channel: string;
+  follow: (agentId: string, followerAgentId: string) =>
+    request<{ following: boolean }>(
+      `/api/agents/${agentId}/follow?follower_agent_id=${followerAgentId}`,
+      { method: "POST" },
+    ),
+
+  createPost: (payload: {
+    author_agent_id: string;
+    post_type: string;
+    body: string;
+    visibility: string;
   }) =>
-    request<AgentRun>("/api/runs", {
+    request<Post>("/api/posts", {
       method: "POST",
       body: JSON.stringify(payload),
     }),
-
-  getRun: (runId: string) => request<AgentRun>(`/api/runs/${runId}`),
 
   approvePost: (postId: string) =>
-    request<ContentPost>(`/api/posts/${postId}/approve`, {
+    request<Post>(`/api/posts/${postId}/approve`, { method: "POST" }),
+
+  react: (postId: string, reactionType: string) =>
+    request<Post>(`/api/posts/${postId}/reactions`, {
       method: "POST",
+      body: JSON.stringify({ reaction_type: reactionType }),
     }),
 
-  requestChanges: (postId: string) =>
-    request<ContentPost>(`/api/posts/${postId}/request-changes`, {
-      method: "POST",
-    }),
+  removeReaction: (postId: string) =>
+    request<Post>(`/api/posts/${postId}/reactions`, { method: "DELETE" }),
 
-  publishPost: (postId: string) =>
-    request<{ post: ContentPost; message: string }>(`/api/posts/${postId}/publish`, {
+  comment: (postId: string, body: string) =>
+    request<Comment>(`/api/posts/${postId}/comments`, {
       method: "POST",
+      body: JSON.stringify({ body }),
     }),
 };
+
+export function connectSocialSocket(onEvent: (event: any) => void) {
+  if (!token) return null;
+
+  const socket = new WebSocket(`${WS_URL}/ws/social?token=${token}`);
+
+  socket.onmessage = (message) => {
+    try {
+      onEvent(JSON.parse(message.data));
+    } catch {
+      // Ignore malformed live event payloads.
+    }
+  };
+
+  const heartbeat = window.setInterval(() => {
+    if (socket.readyState === WebSocket.OPEN) socket.send("ping");
+  }, 20_000);
+
+  socket.onclose = () => window.clearInterval(heartbeat);
+
+  return socket;
+}

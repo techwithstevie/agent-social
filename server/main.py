@@ -1,50 +1,52 @@
 from __future__ import annotations
 
-import hashlib
-import hmac
+import asyncio
 import json
 import os
-import re
-import secrets
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
-from typing import Any, Literal
+from typing import Any
 
-import httpx
 import jwt
 from dotenv import load_dotenv
-from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, status
+from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, ConfigDict, EmailStr, Field
 from pwdlib import PasswordHash
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, JSON, String, Text, create_engine, func, select
-from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, JSON, String, Text, UniqueConstraint, create_engine, func, select
+from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
 load_dotenv()
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./agent_social.db")
-SECRET_KEY = os.getenv("SECRET_KEY", "development-secret-change-me")
-CLIENT_ORIGIN = os.getenv("CLIENT_ORIGIN", "http://localhost:5173")
-LLM_PROVIDER = os.getenv("LLM_PROVIDER", "mock").lower()
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
-PUBLISH_WEBHOOK_URL = os.getenv("PUBLISH_WEBHOOK_URL", "")
-PUBLISH_WEBHOOK_SECRET = os.getenv("PUBLISH_WEBHOOK_SECRET", "")
+SECRET_KEY = os.getenv("SECRET_KEY", "change-me")
+CLIENT_ORIGINS = [
+    origin.strip()
+    for origin in os.getenv("CLIENT_ORIGINS", "http://localhost:5173").split(",")
+    if origin.strip()
+]
 
 JWT_ALGORITHM = "HS256"
-ACCESS_TOKEN_HOURS = 24
-password_hash = PasswordHash.recommended()
+TOKEN_HOURS = 24
 security = HTTPBearer()
+password_hash = PasswordHash.recommended()
 
 engine_kwargs: dict[str, Any] = {"future": True}
 if DATABASE_URL.startswith("sqlite"):
     engine_kwargs["connect_args"] = {"check_same_thread": False}
 
 engine = create_engine(DATABASE_URL, **engine_kwargs)
-SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False)
+SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False, expire_on_commit=False)
+
+
+def now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def new_id(prefix: str) -> str:
+    return f"{prefix}_{uuid.uuid4().hex[:18]}"
 
 
 class Base(DeclarativeBase):
@@ -56,9 +58,7 @@ class Organization(Base):
 
     id: Mapped[str] = mapped_column(String(40), primary_key=True)
     name: Mapped[str] = mapped_column(String(120), nullable=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: utcnow())
-
-    users: Mapped[list["User"]] = relationship(back_populates="organization")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
 
 
 class User(Base):
@@ -67,12 +67,10 @@ class User(Base):
     id: Mapped[str] = mapped_column(String(40), primary_key=True)
     organization_id: Mapped[str] = mapped_column(ForeignKey("organizations.id"), index=True)
     name: Mapped[str] = mapped_column(String(120), nullable=False)
-    email: Mapped[str] = mapped_column(String(255), unique=True, index=True, nullable=False)
+    email: Mapped[str] = mapped_column(String(255), unique=True, index=True)
     password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
     role: Mapped[str] = mapped_column(String(30), default="owner")
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: utcnow())
-
-    organization: Mapped["Organization"] = relationship(back_populates="users")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
 
 
 class Agent(Base):
@@ -81,67 +79,59 @@ class Agent(Base):
     id: Mapped[str] = mapped_column(String(40), primary_key=True)
     organization_id: Mapped[str] = mapped_column(ForeignKey("organizations.id"), index=True)
     name: Mapped[str] = mapped_column(String(100), nullable=False)
+    handle: Mapped[str] = mapped_column(String(50), unique=True, index=True)
     role: Mapped[str] = mapped_column(String(150), nullable=False)
-    instructions: Mapped[str] = mapped_column(Text, nullable=False)
+    bio: Mapped[str] = mapped_column(Text, nullable=False)
+    capabilities: Mapped[list[str]] = mapped_column(JSON, default=list)
     channels: Mapped[list[str]] = mapped_column(JSON, default=list)
-    status: Mapped[str] = mapped_column(String(30), default="active")
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: utcnow())
+    autonomy_mode: Mapped[str] = mapped_column(String(40), default="approval_required")
+    status: Mapped[str] = mapped_column(String(30), default="online")
+    is_public: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
 
 
-class Campaign(Base):
-    __tablename__ = "campaigns"
-
-    id: Mapped[str] = mapped_column(String(40), primary_key=True)
-    organization_id: Mapped[str] = mapped_column(ForeignKey("organizations.id"), index=True)
-    name: Mapped[str] = mapped_column(String(160), nullable=False)
-    objective: Mapped[str] = mapped_column(Text, nullable=False)
-    audience: Mapped[str] = mapped_column(Text, nullable=False)
-    brand_voice: Mapped[str] = mapped_column(Text, nullable=False)
-    channels: Mapped[list[str]] = mapped_column(JSON, default=list)
-    status: Mapped[str] = mapped_column(String(30), default="active")
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: utcnow())
-
-
-class AgentRun(Base):
-    __tablename__ = "agent_runs"
+class Follow(Base):
+    __tablename__ = "follows"
 
     id: Mapped[str] = mapped_column(String(40), primary_key=True)
-    organization_id: Mapped[str] = mapped_column(ForeignKey("organizations.id"), index=True)
-    agent_id: Mapped[str] = mapped_column(ForeignKey("agents.id"))
-    campaign_id: Mapped[str] = mapped_column(ForeignKey("campaigns.id"))
-    topic: Mapped[str] = mapped_column(Text, nullable=False)
-    channel: Mapped[str] = mapped_column(String(60), nullable=False)
-    status: Mapped[str] = mapped_column(String(30), default="queued")
-    provider: Mapped[str] = mapped_column(String(50), default="mock")
-    model: Mapped[str] = mapped_column(String(120), default="mock-social-writer")
-    input_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
-    output_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
-    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
-    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: utcnow())
+    follower_agent_id: Mapped[str] = mapped_column(ForeignKey("agents.id"), index=True)
+    followed_agent_id: Mapped[str] = mapped_column(ForeignKey("agents.id"), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
 
 
-class ContentPost(Base):
-    __tablename__ = "content_posts"
+class SocialPost(Base):
+    __tablename__ = "social_posts"
 
     id: Mapped[str] = mapped_column(String(40), primary_key=True)
+    author_agent_id: Mapped[str] = mapped_column(ForeignKey("agents.id"), index=True)
     organization_id: Mapped[str] = mapped_column(ForeignKey("organizations.id"), index=True)
-    campaign_id: Mapped[str] = mapped_column(ForeignKey("campaigns.id"))
-    agent_id: Mapped[str] = mapped_column(ForeignKey("agents.id"))
-    agent_run_id: Mapped[str] = mapped_column(ForeignKey("agent_runs.id"))
-    title: Mapped[str] = mapped_column(String(240), nullable=False)
+    post_type: Mapped[str] = mapped_column(String(40), default="insight")
     body: Mapped[str] = mapped_column(Text, nullable=False)
-    channel: Mapped[str] = mapped_column(String(60), nullable=False)
-    hashtags: Mapped[list[str]] = mapped_column(JSON, default=list)
-    risk_flags: Mapped[list[str]] = mapped_column(JSON, default=list)
-    risk_score: Mapped[int] = mapped_column(Integer, default=0)
-    status: Mapped[str] = mapped_column(String(30), default="in_review")
-    approved_by_user_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True)
-    approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    publish_response: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: utcnow())
+    status: Mapped[str] = mapped_column(String(40), default="published")
+    visibility: Mapped[str] = mapped_column(String(30), default="network")
+    source: Mapped[str] = mapped_column(String(30), default="agent")
+    provenance: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+
+class Reaction(Base):
+    __tablename__ = "reactions"
+
+    id: Mapped[str] = mapped_column(String(40), primary_key=True)
+    post_id: Mapped[str] = mapped_column(ForeignKey("social_posts.id"), index=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    reaction_type: Mapped[str] = mapped_column(String(30), default="helpful")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+
+class Comment(Base):
+    __tablename__ = "comments"
+
+    id: Mapped[str] = mapped_column(String(40), primary_key=True)
+    post_id: Mapped[str] = mapped_column(ForeignKey("social_posts.id"), index=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    body: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
 
 
 class AuditEvent(Base):
@@ -149,24 +139,16 @@ class AuditEvent(Base):
 
     id: Mapped[str] = mapped_column(String(40), primary_key=True)
     organization_id: Mapped[str] = mapped_column(ForeignKey("organizations.id"), index=True)
-    actor_type: Mapped[str] = mapped_column(String(30), nullable=False)
     actor_id: Mapped[str] = mapped_column(String(40), nullable=False)
+    actor_type: Mapped[str] = mapped_column(String(30), nullable=False)
     action: Mapped[str] = mapped_column(String(100), nullable=False)
-    resource_type: Mapped[str] = mapped_column(String(60), nullable=False)
     resource_id: Mapped[str] = mapped_column(String(40), nullable=False)
+    resource_type: Mapped[str] = mapped_column(String(50), nullable=False)
     detail: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: utcnow())
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
 
 
-def utcnow() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-def make_id(prefix: str) -> str:
-    return f"{prefix}_{uuid.uuid4().hex[:18]}"
-
-
-def db_session():
+def get_db():
     db = SessionLocal()
     try:
         yield db
@@ -174,73 +156,93 @@ def db_session():
         db.close()
 
 
-def create_access_token(user: User) -> str:
-    payload = {
-        "sub": user.id,
-        "org": user.organization_id,
-        "role": user.role,
-        "exp": utcnow() + timedelta(hours=ACCESS_TOKEN_HOURS),
-    }
-    return jwt.encode(payload, SECRET_KEY, algorithm=JWT_ALGORITHM)
+def create_token(user: User) -> str:
+    return jwt.encode(
+        {
+            "sub": user.id,
+            "org": user.organization_id,
+            "exp": now() + timedelta(hours=TOKEN_HOURS),
+        },
+        SECRET_KEY,
+        algorithm=JWT_ALGORITHM,
+    )
 
 
-def get_current_user(
+def current_user(
     credentials: HTTPAuthorizationCredentials = Depends(security),
-    db: Session = Depends(db_session),
+    db: Session = Depends(get_db),
 ) -> User:
     try:
-        payload = jwt.decode(
-            credentials.credentials,
-            SECRET_KEY,
-            algorithms=[JWT_ALGORITHM],
-        )
+        payload = jwt.decode(credentials.credentials, SECRET_KEY, algorithms=[JWT_ALGORITHM])
         user = db.get(User, payload.get("sub"))
         if not user:
-            raise ValueError("User no longer exists")
+            raise ValueError()
         return user
     except (jwt.InvalidTokenError, ValueError):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or expired access token.",
+        raise HTTPException(status_code=401, detail="Invalid or expired access token.")
+
+
+def owned_agent(db: Session, agent_id: str, user: User) -> Agent:
+    agent = db.scalar(
+        select(Agent).where(
+            Agent.id == agent_id,
+            Agent.organization_id == user.organization_id,
         )
-
-
-def require_owner_or_editor(user: User) -> None:
-    if user.role not in {"owner", "admin", "editor"}:
-        raise HTTPException(status_code=403, detail="Insufficient permission.")
-
-
-def owned_or_404(db: Session, model: Any, item_id: str, organization_id: str):
-    item = db.scalar(
-        select(model).where(model.id == item_id, model.organization_id == organization_id)
     )
-    if not item:
-        raise HTTPException(status_code=404, detail="Resource not found.")
-    return item
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found.")
+    return agent
 
 
 def audit(
     db: Session,
-    organization_id: str,
-    actor_type: str,
-    actor_id: str,
+    user: User,
     action: str,
-    resource_type: str,
     resource_id: str,
+    resource_type: str,
     detail: dict[str, Any],
-) -> None:
+):
     db.add(
         AuditEvent(
-            id=make_id("audit"),
-            organization_id=organization_id,
-            actor_type=actor_type,
-            actor_id=actor_id,
+            id=new_id("audit"),
+            organization_id=user.organization_id,
+            actor_id=user.id,
+            actor_type="user",
             action=action,
-            resource_type=resource_type,
             resource_id=resource_id,
+            resource_type=resource_type,
             detail=detail,
         )
     )
+
+
+class SocketManager:
+    def __init__(self):
+        self.connections: list[WebSocket] = []
+
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.connections.append(websocket)
+
+    def disconnect(self, websocket: WebSocket):
+        if websocket in self.connections:
+            self.connections.remove(websocket)
+
+    async def broadcast(self, event_type: str, payload: dict[str, Any]):
+        message = json.dumps({"type": event_type, "payload": payload}, default=str)
+        dead: list[WebSocket] = []
+
+        for socket in self.connections:
+            try:
+                await socket.send_text(message)
+            except Exception:
+                dead.append(socket)
+
+        for socket in dead:
+            self.disconnect(socket)
+
+
+sockets = SocketManager()
 
 
 class Schema(BaseModel):
@@ -256,7 +258,7 @@ class RegisterInput(Schema):
 
 class LoginInput(Schema):
     email: EmailStr
-    password: str = Field(min_length=1)
+    password: str
 
 
 class UserOut(Schema):
@@ -275,342 +277,147 @@ class AuthOut(Schema):
 
 class AgentCreate(Schema):
     name: str = Field(min_length=2, max_length=100)
+    handle: str = Field(min_length=3, max_length=50)
     role: str = Field(min_length=2, max_length=150)
-    instructions: str = Field(min_length=20, max_length=3000)
+    bio: str = Field(min_length=20, max_length=1500)
+    capabilities: list[str] = Field(min_length=1, max_length=10)
     channels: list[str] = Field(min_length=1, max_length=5)
+    autonomy_mode: str = "approval_required"
+    is_public: bool = True
 
 
 class AgentOut(Schema):
     id: str
+    organization_id: str
     name: str
+    handle: str
     role: str
-    instructions: str
+    bio: str
+    capabilities: list[str]
     channels: list[str]
+    autonomy_mode: str
     status: str
+    is_public: bool
     created_at: datetime
+    followers: int = 0
+    following: int = 0
 
 
-class CampaignCreate(Schema):
-    name: str = Field(min_length=2, max_length=160)
-    objective: str = Field(min_length=10, max_length=1500)
-    audience: str = Field(min_length=5, max_length=1000)
-    brand_voice: str = Field(min_length=5, max_length=1000)
-    channels: list[str] = Field(min_length=1, max_length=5)
+class AgentStatusInput(Schema):
+    status: str = Field(pattern="^(online|thinking|paused|offline)$")
 
 
-class CampaignOut(Schema):
+class PostCreate(Schema):
+    author_agent_id: str
+    post_type: str = Field(pattern="^(insight|question|collaboration_request|capability_offer|project_update|research_summary|opportunity)$")
+    body: str = Field(min_length=10, max_length=4000)
+    visibility: str = Field(default="network", pattern="^(network|public|private)$")
+
+
+class PostOut(Schema):
     id: str
-    name: str
-    objective: str
-    audience: str
-    brand_voice: str
-    channels: list[str]
-    status: str
-    created_at: datetime
-
-
-class RunCreate(Schema):
-    agent_id: str
-    campaign_id: str
-    topic: str = Field(min_length=5, max_length=500)
-    channel: str = Field(min_length=2, max_length=60)
-
-
-class RunOut(Schema):
-    id: str
-    agent_id: str
-    campaign_id: str
-    topic: str
-    channel: str
-    status: str
-    provider: str
-    model: str
-    output_json: dict[str, Any] | None
-    error_message: str | None
-    started_at: datetime | None
-    completed_at: datetime | None
-    created_at: datetime
-
-
-class ContentOut(Schema):
-    id: str
-    campaign_id: str
-    agent_id: str
-    agent_run_id: str
-    title: str
+    author_agent_id: str
+    author_name: str
+    author_handle: str
+    author_role: str
+    post_type: str
     body: str
-    channel: str
-    hashtags: list[str]
-    risk_flags: list[str]
-    risk_score: int
     status: str
-    approved_at: datetime | None
-    published_at: datetime | None
-    publish_response: dict[str, Any] | None
+    visibility: str
+    source: str
+    provenance: dict[str, Any]
     created_at: datetime
+    reaction_count: int
+    comment_count: int
+    viewer_reaction: str | None
 
 
-class AuditOut(Schema):
+class ReactionInput(Schema):
+    reaction_type: str = Field(pattern="^(helpful|insightful|interesting|support)$")
+
+
+class CommentInput(Schema):
+    body: str = Field(min_length=1, max_length=1500)
+
+
+class CommentOut(Schema):
     id: str
-    actor_type: str
-    action: str
-    resource_type: str
-    resource_id: str
-    detail: dict[str, Any]
+    post_id: str
+    user_name: str
+    body: str
     created_at: datetime
 
 
-class PublishOut(Schema):
-    post: ContentOut
-    message: str
+class DashboardOut(Schema):
+    owned_agents: int
+    online_agents: int
+    drafts_waiting: int
+    published_posts: int
+    total_followers: int
 
 
-def extract_json(text: str) -> dict[str, Any]:
-    fenced = re.search(r"```(?:json)?\s*(\{.*\})\s*```", text, flags=re.DOTALL)
-    candidate = fenced.group(1) if fenced else text.strip()
-    return json.loads(candidate)
+def agent_out(db: Session, agent: Agent) -> AgentOut:
+    followers = db.scalar(
+        select(func.count()).select_from(Follow).where(Follow.followed_agent_id == agent.id)
+    ) or 0
+    following = db.scalar(
+        select(func.count()).select_from(Follow).where(Follow.follower_agent_id == agent.id)
+    ) or 0
 
-
-def validate_model_output(raw: dict[str, Any], topic: str) -> dict[str, Any]:
-    title = str(raw.get("title", topic)).strip()[:240]
-    body = str(raw.get("body", "")).strip()
-    hashtags = raw.get("hashtags", [])
-    risk_flags = raw.get("risk_flags", [])
-
-    if not title or len(body) < 40:
-        raise ValueError("The LLM returned incomplete post content.")
-
-    if not isinstance(hashtags, list):
-        hashtags = []
-    if not isinstance(risk_flags, list):
-        risk_flags = []
-
-    clean_hashtags = [
-        f"#{str(tag).strip().lstrip('#').replace(' ', '')}"
-        for tag in hashtags[:8]
-        if str(tag).strip()
-    ]
-    clean_flags = [str(flag).strip()[:140] for flag in risk_flags[:8] if str(flag).strip()]
-
-    return {
-        "title": title,
-        "body": body,
-        "hashtags": clean_hashtags,
-        "risk_flags": clean_flags,
-        "risk_score": min(100, len(clean_flags) * 15),
-    }
-
-
-def mock_generate(topic: str, campaign: Campaign, agent: Agent, channel: str) -> dict[str, Any]:
-    body = (
-        f"{topic}\n\n"
-        f"The best social programs are not built around posting more. They are built "
-        f"around turning real expertise into useful, repeatable conversations.\n\n"
-        f"For {campaign.name}, that means a clear objective: {campaign.objective}\n\n"
-        f"Our operating model is simple: specialized AI agents prepare the work, "
-        f"brand and policy checks constrain it, and people approve every meaningful "
-        f"external action before it is published.\n\n"
-        f"What part of your content workflow would benefit most from that model?"
+    return AgentOut(
+        id=agent.id,
+        organization_id=agent.organization_id,
+        name=agent.name,
+        handle=agent.handle,
+        role=agent.role,
+        bio=agent.bio,
+        capabilities=agent.capabilities,
+        channels=agent.channels,
+        autonomy_mode=agent.autonomy_mode,
+        status=agent.status,
+        is_public=agent.is_public,
+        created_at=agent.created_at,
+        followers=followers,
+        following=following,
     )
 
-    return {
-        "title": topic[:240],
-        "body": body,
-        "hashtags": ["AIAgents", "B2BMarketing", "SocialMediaStrategy"],
-        "risk_flags": [],
-        "risk_score": 0,
-    }
 
+def post_out(db: Session, post: SocialPost, viewer_id: str | None) -> PostOut:
+    author = db.get(Agent, post.author_agent_id)
+    reaction_count = db.scalar(
+        select(func.count()).select_from(Reaction).where(Reaction.post_id == post.id)
+    ) or 0
+    comment_count = db.scalar(
+        select(func.count()).select_from(Comment).where(Comment.post_id == post.id)
+    ) or 0
 
-async def llm_generate(topic: str, campaign: Campaign, agent: Agent, channel: str) -> dict[str, Any]:
-    if LLM_PROVIDER == "mock":
-        return mock_generate(topic, campaign, agent, channel)
-
-    if not OPENAI_API_KEY:
-        raise ValueError("OPENAI_API_KEY is required when LLM_PROVIDER is not mock.")
-
-    system_prompt = """
-You are a senior B2B social-media strategist. Return ONLY valid JSON.
-Do not include markdown fences or commentary.
-
-Required schema:
-{
-  "title": "short title",
-  "body": "channel-specific post body",
-  "hashtags": ["TagOne", "TagTwo"],
-  "risk_flags": ["only actual policy, compliance, or certainty concerns"]
-}
-
-Rules:
-- Make the post useful, specific, credible, and concise.
-- Do not invent results, customers, product features, statistics, or testimonials.
-- Do not make legal, medical, financial, or guaranteed-performance claims.
-- Respect the supplied brand voice.
-""".strip()
-
-    user_prompt = f"""
-Campaign: {campaign.name}
-Objective: {campaign.objective}
-Audience: {campaign.audience}
-Brand voice: {campaign.brand_voice}
-Agent role: {agent.role}
-Agent instructions: {agent.instructions}
-Channel: {channel}
-Topic: {topic}
-""".strip()
-
-    payload = {
-        "model": OPENAI_MODEL,
-        "input": [
-            {"role": "system", "content": [{"type": "input_text", "text": system_prompt}]},
-            {"role": "user", "content": [{"type": "input_text", "text": user_prompt}]},
-        ],
-    }
-
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json",
-    }
-
-    async with httpx.AsyncClient(timeout=90) as client:
-        response = await client.post(
-            f"{OPENAI_BASE_URL}/responses",
-            headers=headers,
-            json=payload,
+    viewer_reaction = None
+    if viewer_id:
+        reaction = db.scalar(
+            select(Reaction).where(
+                Reaction.post_id == post.id,
+                Reaction.user_id == viewer_id,
+            )
         )
-        response.raise_for_status()
-        data = response.json()
+        viewer_reaction = reaction.reaction_type if reaction else None
 
-    text = data.get("output_text", "")
-    if not text:
-        chunks = []
-        for output in data.get("output", []):
-            for content in output.get("content", []):
-                if content.get("type") in {"output_text", "text"}:
-                    chunks.append(content.get("text", ""))
-        text = "\n".join(chunks)
-
-    return validate_model_output(extract_json(text), topic)
-
-
-async def execute_run(run_id: str) -> None:
-    db = SessionLocal()
-
-    try:
-        run = db.get(AgentRun, run_id)
-        if not run:
-            return
-
-        agent = db.get(Agent, run.agent_id)
-        campaign = db.get(Campaign, run.campaign_id)
-
-        if not agent or not campaign:
-            run.status = "failed"
-            run.error_message = "Agent or campaign no longer exists."
-            run.completed_at = utcnow()
-            db.commit()
-            return
-
-        run.status = "running"
-        run.started_at = utcnow()
-        db.commit()
-
-        generated = await llm_generate(run.topic, campaign, agent, run.channel)
-        generated = validate_model_output(generated, run.topic)
-
-        run.output_json = generated
-        run.status = "completed"
-        run.completed_at = utcnow()
-
-        post = ContentPost(
-            id=make_id("post"),
-            organization_id=run.organization_id,
-            campaign_id=campaign.id,
-            agent_id=agent.id,
-            agent_run_id=run.id,
-            title=generated["title"],
-            body=generated["body"],
-            channel=run.channel,
-            hashtags=generated["hashtags"],
-            risk_flags=generated["risk_flags"],
-            risk_score=generated["risk_score"],
-            status="in_review",
-        )
-        db.add(post)
-
-        audit(
-            db,
-            run.organization_id,
-            "agent",
-            agent.id,
-            "agent_run.completed",
-            "content_post",
-            post.id,
-            {"run_id": run.id, "channel": run.channel, "risk_score": post.risk_score},
-        )
-        db.commit()
-
-    except Exception as exc:
-        db.rollback()
-        run = db.get(AgentRun, run_id)
-        if run:
-            run.status = "failed"
-            run.error_message = str(exc)[:2000]
-            run.completed_at = utcnow()
-            db.commit()
-    finally:
-        db.close()
-
-
-async def publish_to_webhook(post: ContentPost, campaign: Campaign) -> dict[str, Any]:
-    if not PUBLISH_WEBHOOK_URL:
-        return {
-            "mode": "simulated",
-            "message": "No PUBLISH_WEBHOOK_URL configured. Post is marked published in local mode.",
-        }
-
-    event = {
-        "event": "agentsocial.post.publish",
-        "idempotency_key": post.id,
-        "post_id": post.id,
-        "campaign_id": campaign.id,
-        "campaign_name": campaign.name,
-        "channel": post.channel,
-        "title": post.title,
-        "body": post.body,
-        "hashtags": post.hashtags,
-        "published_at": utcnow().isoformat(),
-    }
-
-    payload = json.dumps(event, separators=(",", ":")).encode("utf-8")
-    signature = hmac.new(
-        PUBLISH_WEBHOOK_SECRET.encode("utf-8"),
-        payload,
-        hashlib.sha256,
-    ).hexdigest()
-
-    async with httpx.AsyncClient(timeout=30) as client:
-        response = await client.post(
-            PUBLISH_WEBHOOK_URL,
-            content=payload,
-            headers={
-                "Content-Type": "application/json",
-                "X-AgentSocial-Signature": f"sha256={signature}",
-                "X-AgentSocial-Event": "post.publish",
-            },
-        )
-        response.raise_for_status()
-
-        try:
-            body: Any = response.json()
-        except Exception:
-            body = response.text[:1000]
-
-    return {
-        "mode": "webhook",
-        "status_code": response.status_code,
-        "response": body,
-    }
+    return PostOut(
+        id=post.id,
+        author_agent_id=post.author_agent_id,
+        author_name=author.name if author else "Unknown Agent",
+        author_handle=author.handle if author else "unknown",
+        author_role=author.role if author else "Unknown role",
+        post_type=post.post_type,
+        body=post.body,
+        status=post.status,
+        visibility=post.visibility,
+        source=post.source,
+        provenance=post.provenance,
+        created_at=post.created_at,
+        reaction_count=reaction_count,
+        comment_count=comment_count,
+        viewer_reaction=viewer_reaction,
+    )
 
 
 @asynccontextmanager
@@ -619,425 +426,484 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(
-    title="AgentSocial API",
-    version="1.0.0",
-    lifespan=lifespan,
-)
+app = FastAPI(title="AgentSocial", version="2.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[CLIENT_ORIGIN],
+    allow_origins=CLIENT_ORIGINS,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
 )
 
 
 @app.get("/health")
-def health() -> dict[str, str]:
-    return {"status": "ok", "provider": LLM_PROVIDER}
+def health():
+    return {"status": "ok"}
 
 
 @app.post("/api/auth/register", response_model=AuthOut, status_code=201)
-def register(payload: RegisterInput, db: Session = Depends(db_session)) -> AuthOut:
-    existing = db.scalar(select(User).where(User.email == payload.email.lower()))
-    if existing:
+def register(payload: RegisterInput, db: Session = Depends(get_db)):
+    email = payload.email.lower()
+    if db.scalar(select(User).where(User.email == email)):
         raise HTTPException(status_code=409, detail="An account already exists for that email.")
 
-    organization = Organization(
-        id=make_id("org"),
-        name=payload.organization_name.strip(),
-    )
+    organization = Organization(id=new_id("org"), name=payload.organization_name.strip())
     user = User(
-        id=make_id("usr"),
+        id=new_id("user"),
         organization_id=organization.id,
         name=payload.name.strip(),
-        email=payload.email.lower(),
+        email=email,
         password_hash=password_hash.hash(payload.password),
         role="owner",
     )
-
     db.add_all([organization, user])
-    audit(
-        db,
-        organization.id,
-        "user",
-        user.id,
-        "organization.created",
-        "organization",
-        organization.id,
-        {"name": organization.name},
-    )
     db.commit()
 
-    return AuthOut(access_token=create_access_token(user), user=user)
+    return AuthOut(access_token=create_token(user), user=user)
 
 
 @app.post("/api/auth/login", response_model=AuthOut)
-def login(payload: LoginInput, db: Session = Depends(db_session)) -> AuthOut:
+def login(payload: LoginInput, db: Session = Depends(get_db)):
     user = db.scalar(select(User).where(User.email == payload.email.lower()))
     if not user or not password_hash.verify(payload.password, user.password_hash):
         raise HTTPException(status_code=401, detail="Invalid email or password.")
 
-    return AuthOut(access_token=create_access_token(user), user=user)
+    return AuthOut(access_token=create_token(user), user=user)
 
 
 @app.get("/api/me", response_model=UserOut)
-def me(user: User = Depends(get_current_user)) -> User:
+def me(user: User = Depends(current_user)):
     return user
 
 
-@app.get("/api/agents", response_model=list[AgentOut])
-def list_agents(user: User = Depends(get_current_user), db: Session = Depends(db_session)):
-    return list(
-        db.scalars(
-            select(Agent)
-            .where(Agent.organization_id == user.organization_id)
-            .order_by(Agent.created_at.desc())
-        )
+@app.get("/api/dashboard", response_model=DashboardOut)
+def dashboard(user: User = Depends(current_user), db: Session = Depends(get_db)):
+    agents = list(
+        db.scalars(select(Agent).where(Agent.organization_id == user.organization_id))
     )
+    agent_ids = [agent.id for agent in agents]
+
+    return DashboardOut(
+        owned_agents=len(agents),
+        online_agents=sum(1 for agent in agents if agent.status in {"online", "thinking"}),
+        drafts_waiting=db.scalar(
+            select(func.count()).select_from(SocialPost).where(
+                SocialPost.organization_id == user.organization_id,
+                SocialPost.status == "in_review",
+            )
+        ) or 0,
+        published_posts=db.scalar(
+            select(func.count()).select_from(SocialPost).where(
+                SocialPost.organization_id == user.organization_id,
+                SocialPost.status == "published",
+            )
+        ) or 0,
+        total_followers=db.scalar(
+            select(func.count()).select_from(Follow).where(
+                Follow.followed_agent_id.in_(agent_ids or ["none"])
+            )
+        ) or 0,
+    )
+
+
+@app.get("/api/agents", response_model=list[AgentOut])
+def list_agents(
+    mine_only: bool = False,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    statement = select(Agent).order_by(Agent.created_at.desc())
+
+    if mine_only:
+        statement = statement.where(Agent.organization_id == user.organization_id)
+    else:
+        statement = statement.where(
+            (Agent.is_public == True) | (Agent.organization_id == user.organization_id)
+        )
+
+    return [agent_out(db, agent) for agent in db.scalars(statement)]
 
 
 @app.post("/api/agents", response_model=AgentOut, status_code=201)
-def create_agent(
+async def create_agent(
     payload: AgentCreate,
-    user: User = Depends(get_current_user),
-    db: Session = Depends(db_session),
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
 ):
-    require_owner_or_editor(user)
+    handle = payload.handle.lower().replace("@", "").replace(" ", "-")
+
+    if db.scalar(select(Agent).where(Agent.handle == handle)):
+        raise HTTPException(status_code=409, detail="That agent handle is already taken.")
 
     agent = Agent(
-        id=make_id("agent"),
+        id=new_id("agent"),
         organization_id=user.organization_id,
         name=payload.name.strip(),
+        handle=handle,
         role=payload.role.strip(),
-        instructions=payload.instructions.strip(),
+        bio=payload.bio.strip(),
+        capabilities=payload.capabilities,
         channels=payload.channels,
+        autonomy_mode=payload.autonomy_mode,
+        is_public=payload.is_public,
     )
     db.add(agent)
-    audit(
-        db,
-        user.organization_id,
-        "user",
-        user.id,
-        "agent.created",
-        "agent",
-        agent.id,
-        {"name": agent.name, "role": agent.role},
-    )
+    audit(db, user, "agent.created", agent.id, "agent", {"name": agent.name})
     db.commit()
     db.refresh(agent)
-    return agent
+
+    response = agent_out(db, agent)
+    await sockets.broadcast("agent.created", response.model_dump(mode="json"))
+    return response
 
 
-@app.get("/api/campaigns", response_model=list[CampaignOut])
-def list_campaigns(user: User = Depends(get_current_user), db: Session = Depends(db_session)):
-    return list(
-        db.scalars(
-            select(Campaign)
-            .where(Campaign.organization_id == user.organization_id)
-            .order_by(Campaign.created_at.desc())
+@app.patch("/api/agents/{agent_id}/status", response_model=AgentOut)
+async def update_agent_status(
+    agent_id: str,
+    payload: AgentStatusInput,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    agent = owned_agent(db, agent_id, user)
+    agent.status = payload.status
+    audit(db, user, "agent.status_changed", agent.id, "agent", {"status": agent.status})
+    db.commit()
+    db.refresh(agent)
+
+    response = agent_out(db, agent)
+    await sockets.broadcast("agent.status.changed", response.model_dump(mode="json"))
+    return response
+
+
+@app.post("/api/agents/{agent_id}/follow")
+async def follow_agent(
+    agent_id: str,
+    follower_agent_id: str,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    follower = owned_agent(db, follower_agent_id, user)
+    followed = db.get(Agent, agent_id)
+
+    if not followed or not followed.is_public:
+        raise HTTPException(status_code=404, detail="Public agent not found.")
+
+    if follower.id == followed.id:
+        raise HTTPException(status_code=400, detail="An agent cannot follow itself.")
+
+    exists = db.scalar(
+        select(Follow).where(
+            Follow.follower_agent_id == follower.id,
+            Follow.followed_agent_id == followed.id,
         )
     )
+    if exists:
+        return {"following": True}
 
-
-@app.post("/api/campaigns", response_model=CampaignOut, status_code=201)
-def create_campaign(
-    payload: CampaignCreate,
-    user: User = Depends(get_current_user),
-    db: Session = Depends(db_session),
-):
-    require_owner_or_editor(user)
-
-    campaign = Campaign(
-        id=make_id("camp"),
-        organization_id=user.organization_id,
-        name=payload.name.strip(),
-        objective=payload.objective.strip(),
-        audience=payload.audience.strip(),
-        brand_voice=payload.brand_voice.strip(),
-        channels=payload.channels,
+    db.add(
+        Follow(
+            id=new_id("follow"),
+            follower_agent_id=follower.id,
+            followed_agent_id=followed.id,
+        )
     )
-    db.add(campaign)
     audit(
         db,
-        user.organization_id,
-        "user",
-        user.id,
-        "campaign.created",
-        "campaign",
-        campaign.id,
-        {"name": campaign.name},
+        user,
+        "agent.followed",
+        followed.id,
+        "agent",
+        {"follower_agent_id": follower.id},
     )
     db.commit()
-    db.refresh(campaign)
-    return campaign
+
+    await sockets.broadcast(
+        "agent.followed",
+        {"follower_agent_id": follower.id, "followed_agent_id": followed.id},
+    )
+    return {"following": True}
 
 
-@app.post("/api/runs", response_model=RunOut, status_code=202)
-async def create_run(
-    payload: RunCreate,
-    background_tasks: BackgroundTasks,
-    user: User = Depends(get_current_user),
-    db: Session = Depends(db_session),
+@app.post("/api/posts", response_model=PostOut, status_code=201)
+async def create_post(
+    payload: PostCreate,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
 ):
-    require_owner_or_editor(user)
+    agent = owned_agent(db, payload.author_agent_id, user)
 
-    agent = owned_or_404(db, Agent, payload.agent_id, user.organization_id)
-    campaign = owned_or_404(db, Campaign, payload.campaign_id, user.organization_id)
+    if agent.status == "paused":
+        raise HTTPException(status_code=409, detail="This agent is paused.")
 
-    if payload.channel not in campaign.channels:
-        raise HTTPException(
-            status_code=400,
-            detail="The selected channel is not enabled for this campaign.",
-        )
+    post_status = (
+        "published"
+        if agent.autonomy_mode == "policy_autonomous"
+        else "in_review"
+    )
 
-    if payload.channel not in agent.channels:
-        raise HTTPException(
-            status_code=400,
-            detail="The selected channel is not enabled for this agent.",
-        )
-
-    run = AgentRun(
-        id=make_id("run"),
+    post = SocialPost(
+        id=new_id("post"),
+        author_agent_id=agent.id,
         organization_id=user.organization_id,
-        agent_id=agent.id,
-        campaign_id=campaign.id,
-        topic=payload.topic.strip(),
-        channel=payload.channel,
-        status="queued",
-        provider=LLM_PROVIDER,
-        model=OPENAI_MODEL if LLM_PROVIDER != "mock" else "mock-social-writer",
-        input_json={
-            "topic": payload.topic.strip(),
-            "channel": payload.channel,
-            "campaign": campaign.name,
-            "agent": agent.name,
+        post_type=payload.post_type,
+        body=payload.body.strip(),
+        status=post_status,
+        visibility=payload.visibility,
+        source="agent",
+        provenance={
+            "autonomy_mode": agent.autonomy_mode,
+            "owner_organization_id": user.organization_id,
+            "human_approved": False,
         },
     )
-    db.add(run)
+    db.add(post)
     audit(
         db,
-        user.organization_id,
-        "user",
-        user.id,
-        "agent_run.queued",
-        "agent_run",
-        run.id,
-        {"agent_id": agent.id, "campaign_id": campaign.id, "topic": run.topic},
+        user,
+        "post.created",
+        post.id,
+        "social_post",
+        {"author_agent_id": agent.id, "status": post_status},
     )
     db.commit()
-    db.refresh(run)
+    db.refresh(post)
 
-    background_tasks.add_task(execute_run, run.id)
-    return run
+    response = post_out(db, post, user.id)
+    await sockets.broadcast("feed.post.created", response.model_dump(mode="json"))
+    return response
 
 
-@app.get("/api/runs/{run_id}", response_model=RunOut)
-def get_run(
-    run_id: str,
-    user: User = Depends(get_current_user),
-    db: Session = Depends(db_session),
+@app.post("/api/posts/{post_id}/approve", response_model=PostOut)
+async def approve_post(
+    post_id: str,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
 ):
-    return owned_or_404(db, AgentRun, run_id, user.organization_id)
+    post = db.scalar(
+        select(SocialPost).where(
+            SocialPost.id == post_id,
+            SocialPost.organization_id == user.organization_id,
+        )
+    )
+    if not post:
+        raise HTTPException(status_code=404, detail="Post not found.")
+
+    if post.status != "in_review":
+        raise HTTPException(status_code=409, detail="Only review posts can be approved.")
+
+    post.status = "published"
+    post.provenance = {**post.provenance, "human_approved": True, "approved_by": user.id}
+    audit(db, user, "post.approved", post.id, "social_post", {})
+    db.commit()
+    db.refresh(post)
+
+    response = post_out(db, post, user.id)
+    await sockets.broadcast("feed.post.published", response.model_dump(mode="json"))
+    return response
 
 
-@app.get("/api/posts", response_model=list[ContentOut])
-def list_posts(
-    status_filter: str | None = None,
-    user: User = Depends(get_current_user),
-    db: Session = Depends(db_session),
+@app.get("/api/feed", response_model=list[PostOut])
+def feed(
+    mode: str = "network",
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
 ):
     statement = (
-        select(ContentPost)
-        .where(ContentPost.organization_id == user.organization_id)
-        .order_by(ContentPost.created_at.desc())
+        select(SocialPost)
+        .where(SocialPost.status == "published")
+        .order_by(SocialPost.created_at.desc())
+        .limit(100)
     )
 
-    if status_filter:
-        statement = statement.where(ContentPost.status == status_filter)
+    if mode == "mine":
+        statement = statement.where(SocialPost.organization_id == user.organization_id)
 
-    return list(db.scalars(statement))
+    posts = list(db.scalars(statement))
+    return [post_out(db, post, user.id) for post in posts]
 
 
-@app.post("/api/posts/{post_id}/approve", response_model=ContentOut)
-def approve_post(
+@app.get("/api/posts/review", response_model=list[PostOut])
+def review_posts(user: User = Depends(current_user), db: Session = Depends(get_db)):
+    posts = list(
+        db.scalars(
+            select(SocialPost)
+            .where(
+                SocialPost.organization_id == user.organization_id,
+                SocialPost.status == "in_review",
+            )
+            .order_by(SocialPost.created_at.desc())
+        )
+    )
+    return [post_out(db, post, user.id) for post in posts]
+
+
+@app.post("/api/posts/{post_id}/reactions", response_model=PostOut)
+async def react(
     post_id: str,
-    user: User = Depends(get_current_user),
-    db: Session = Depends(db_session),
+    payload: ReactionInput,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
 ):
-    require_owner_or_editor(user)
-    post = owned_or_404(db, ContentPost, post_id, user.organization_id)
+    post = db.get(SocialPost, post_id)
+    if not post or post.status != "published":
+        raise HTTPException(status_code=404, detail="Published post not found.")
 
-    if post.status != "in_review":
-        raise HTTPException(status_code=409, detail="Only posts in review can be approved.")
-
-    post.status = "approved"
-    post.approved_by_user_id = user.id
-    post.approved_at = utcnow()
-    audit(
-        db,
-        user.organization_id,
-        "user",
-        user.id,
-        "post.approved",
-        "content_post",
-        post.id,
-        {"title": post.title},
+    reaction = db.scalar(
+        select(Reaction).where(
+            Reaction.post_id == post.id,
+            Reaction.user_id == user.id,
+        )
     )
+
+    if reaction:
+        reaction.reaction_type = payload.reaction_type
+    else:
+        db.add(
+            Reaction(
+                id=new_id("reaction"),
+                post_id=post.id,
+                user_id=user.id,
+                reaction_type=payload.reaction_type,
+            )
+        )
+
     db.commit()
-    db.refresh(post)
-    return post
+    response = post_out(db, post, user.id)
+    await sockets.broadcast("feed.post.reacted", response.model_dump(mode="json"))
+    return response
 
 
-@app.post("/api/posts/{post_id}/request-changes", response_model=ContentOut)
-def request_changes(
+@app.delete("/api/posts/{post_id}/reactions", response_model=PostOut)
+async def remove_reaction(
     post_id: str,
-    user: User = Depends(get_current_user),
-    db: Session = Depends(db_session),
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
 ):
-    require_owner_or_editor(user)
-    post = owned_or_404(db, ContentPost, post_id, user.organization_id)
+    post = db.get(SocialPost, post_id)
+    if not post:
+        raise HTTPException(status_code=404, detail="Post not found.")
 
-    if post.status != "in_review":
-        raise HTTPException(status_code=409, detail="Only posts in review can be returned.")
-
-    post.status = "changes_requested"
-    audit(
-        db,
-        user.organization_id,
-        "user",
-        user.id,
-        "post.changes_requested",
-        "content_post",
-        post.id,
-        {"title": post.title},
+    reaction = db.scalar(
+        select(Reaction).where(
+            Reaction.post_id == post.id,
+            Reaction.user_id == user.id,
+        )
     )
-    db.commit()
-    db.refresh(post)
-    return post
+
+    if reaction:
+        db.delete(reaction)
+        db.commit()
+
+    response = post_out(db, post, user.id)
+    await sockets.broadcast("feed.post.reacted", response.model_dump(mode="json"))
+    return response
 
 
-@app.post("/api/posts/{post_id}/publish", response_model=PublishOut)
-async def publish_post(
+@app.get("/api/posts/{post_id}/comments", response_model=list[CommentOut])
+def comments(post_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    post = db.get(SocialPost, post_id)
+    if not post:
+        raise HTTPException(status_code=404, detail="Post not found.")
+
+    rows = list(
+        db.scalars(
+            select(Comment)
+            .where(Comment.post_id == post_id)
+            .order_by(Comment.created_at.asc())
+        )
+    )
+
+    return [
+        CommentOut(
+            id=row.id,
+            post_id=row.post_id,
+            user_name=(db.get(User, row.user_id).name if db.get(User, row.user_id) else "Unknown"),
+            body=row.body,
+            created_at=row.created_at,
+        )
+        for row in rows
+    ]
+
+
+@app.post("/api/posts/{post_id}/comments", response_model=CommentOut, status_code=201)
+async def add_comment(
     post_id: str,
-    user: User = Depends(get_current_user),
-    db: Session = Depends(db_session),
+    payload: CommentInput,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
 ):
-    require_owner_or_editor(user)
-    post = owned_or_404(db, ContentPost, post_id, user.organization_id)
+    post = db.get(SocialPost, post_id)
+    if not post or post.status != "published":
+        raise HTTPException(status_code=404, detail="Published post not found.")
 
-    if post.status != "approved":
-        raise HTTPException(status_code=409, detail="Only approved posts can be published.")
+    comment = Comment(
+        id=new_id("comment"),
+        post_id=post.id,
+        user_id=user.id,
+        body=payload.body.strip(),
+    )
+    db.add(comment)
+    audit(db, user, "comment.created", comment.id, "comment", {"post_id": post.id})
+    db.commit()
+    db.refresh(comment)
 
-    campaign = owned_or_404(db, Campaign, post.campaign_id, user.organization_id)
+    response = CommentOut(
+        id=comment.id,
+        post_id=comment.post_id,
+        user_name=user.name,
+        body=comment.body,
+        created_at=comment.created_at,
+    )
 
-    try:
-        result = await publish_to_webhook(post, campaign)
-        post.status = "published"
-        post.published_at = utcnow()
-        post.publish_response = result
-
-        audit(
-            db,
-            user.organization_id,
-            "user",
-            user.id,
-            "post.published",
-            "content_post",
-            post.id,
-            result,
-        )
-        db.commit()
-        db.refresh(post)
-
-        return PublishOut(
-            post=post,
-            message=(
-                "Published through webhook."
-                if result["mode"] == "webhook"
-                else "Published in local simulation mode. Configure PUBLISH_WEBHOOK_URL for a real outbound action."
-            ),
-        )
-    except httpx.HTTPError as exc:
-        post.status = "publish_failed"
-        post.publish_response = {"error": str(exc)}
-        audit(
-            db,
-            user.organization_id,
-            "system",
-            "publisher",
-            "post.publish_failed",
-            "content_post",
-            post.id,
-            {"error": str(exc)},
-        )
-        db.commit()
-        raise HTTPException(status_code=502, detail=f"Publishing failed: {exc}") from exc
+    await sockets.broadcast("feed.comment.created", response.model_dump(mode="json"))
+    return response
 
 
-@app.get("/api/audit", response_model=list[AuditOut])
-def list_audit(
-    user: User = Depends(get_current_user),
-    db: Session = Depends(db_session),
-):
-    return list(
+@app.get("/api/audit")
+def audit_log(user: User = Depends(current_user), db: Session = Depends(get_db)):
+    events = list(
         db.scalars(
             select(AuditEvent)
             .where(AuditEvent.organization_id == user.organization_id)
             .order_by(AuditEvent.created_at.desc())
-            .limit(50)
+            .limit(100)
         )
     )
 
+    return [
+        {
+            "id": event.id,
+            "action": event.action,
+            "resource_id": event.resource_id,
+            "resource_type": event.resource_type,
+            "detail": event.detail,
+            "created_at": event.created_at,
+        }
+        for event in events
+    ]
 
-@app.get("/api/dashboard")
-def dashboard(
-    user: User = Depends(get_current_user),
-    db: Session = Depends(db_session),
-):
-    org_id = user.organization_id
 
-    active_campaigns = db.scalar(
-        select(func.count()).select_from(Campaign).where(
-            Campaign.organization_id == org_id,
-            Campaign.status == "active",
-        )
-    ) or 0
+@app.websocket("/ws/social")
+async def social_socket(websocket: WebSocket):
+    token = websocket.query_params.get("token")
 
-    review_count = db.scalar(
-        select(func.count()).select_from(ContentPost).where(
-            ContentPost.organization_id == org_id,
-            ContentPost.status == "in_review",
-        )
-    ) or 0
+    if not token:
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        return
 
-    approved_count = db.scalar(
-        select(func.count()).select_from(ContentPost).where(
-            ContentPost.organization_id == org_id,
-            ContentPost.status == "approved",
-        )
-    ) or 0
+    try:
+        jwt.decode(token, SECRET_KEY, algorithms=[JWT_ALGORITHM])
+    except jwt.InvalidTokenError:
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        return
 
-    published_count = db.scalar(
-        select(func.count()).select_from(ContentPost).where(
-            ContentPost.organization_id == org_id,
-            ContentPost.status == "published",
-        )
-    ) or 0
+    await sockets.connect(websocket)
 
-    total_runs = db.scalar(
-        select(func.count()).select_from(AgentRun).where(
-            AgentRun.organization_id == org_id
-        )
-    ) or 0
+    try:
+        await websocket.send_json({"type": "connected", "payload": {"message": "Live feed connected"}})
 
-    return {
-        "active_campaigns": active_campaigns,
-        "awaiting_review": review_count,
-        "approved_ready": approved_count,
-        "published": published_count,
-        "total_runs": total_runs,
-        "provider": LLM_PROVIDER,
-    }
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        sockets.disconnect(websocket)

@@ -5,92 +5,104 @@ import {
   Check,
   ChevronRight,
   CircleAlert,
-  FilePenLine,
+  Compass,
+  FileText,
+  Heart,
   LayoutDashboard,
   LoaderCircle,
   LogOut,
-  Megaphone,
+  MessageCircle,
   Plus,
-  Rocket,
+  Radio,
+  Search,
   Send,
   ShieldCheck,
   Sparkles,
+  Users,
   X,
 } from "lucide-react";
 import {
   api,
   auth,
+  connectSocialSocket,
   type Agent,
-  type AgentRun,
-  type AuditEvent,
-  type Campaign,
-  type ContentPost,
+  type Comment,
   type Dashboard,
+  type Post,
   type User,
 } from "./api";
 
-type View = "overview" | "campaigns" | "agents" | "review" | "audit";
-type ModalName = "agent" | "campaign" | "generate" | null;
+type View = "feed" | "explore" | "console" | "review" | "audit";
+type ModalName = "agent" | "post" | null;
 
-const nav: Array<{ id: View; label: string; icon: typeof LayoutDashboard }> = [
-  { id: "overview", label: "Overview", icon: LayoutDashboard },
-  { id: "campaigns", label: "Campaigns", icon: Megaphone },
-  { id: "agents", label: "Agent Studio", icon: Bot },
-  { id: "review", label: "Review Queue", icon: ShieldCheck },
-  { id: "audit", label: "Audit Log", icon: Activity },
+const nav = [
+  { id: "feed" as View, label: "Home Feed", icon: LayoutDashboard },
+  { id: "explore" as View, label: "Explore Agents", icon: Compass },
+  { id: "console" as View, label: "Agent Console", icon: Bot },
+  { id: "review" as View, label: "Review Queue", icon: ShieldCheck },
+  { id: "audit" as View, label: "Audit Log", icon: Activity },
 ];
 
-function relativeTime(date: string) {
-  const difference = Math.max(1, Date.now() - new Date(date).getTime());
-  const minutes = Math.floor(difference / 60_000);
-  if (minutes < 60) return `${minutes}m ago`;
-  if (minutes < 1440) return `${Math.floor(minutes / 60)}h ago`;
-  return `${Math.floor(minutes / 1440)}d ago`;
+const postTypes = [
+  "insight",
+  "question",
+  "collaboration_request",
+  "capability_offer",
+  "project_update",
+  "research_summary",
+  "opportunity",
+];
+
+function ago(value: string) {
+  const minutes = Math.max(1, Math.floor((Date.now() - new Date(value).getTime()) / 60_000));
+  if (minutes < 60) return `${minutes}m`;
+  if (minutes < 1440) return `${Math.floor(minutes / 60)}h`;
+  return `${Math.floor(minutes / 1440)}d`;
 }
 
-function shortStatus(status: string) {
-  return status.replaceAll("_", " ");
+function title(value: string) {
+  return value.replaceAll("_", " ");
 }
 
 export default function App() {
-  const [loggedIn, setLoggedIn] = useState(auth.isLoggedIn());
+  const [loggedIn, setLoggedIn] = useState(auth.loggedIn());
   const [user, setUser] = useState<User | null>(null);
   const [dashboard, setDashboard] = useState<Dashboard | null>(null);
   const [agents, setAgents] = useState<Agent[]>([]);
-  const [campaigns, setCampaigns] = useState<Campaign[]>([]);
-  const [posts, setPosts] = useState<ContentPost[]>([]);
-  const [auditEvents, setAuditEvents] = useState<AuditEvent[]>([]);
-  const [view, setView] = useState<View>("overview");
+  const [allAgents, setAllAgents] = useState<Agent[]>([]);
+  const [posts, setPosts] = useState<Post[]>([]);
+  const [reviewPosts, setReviewPosts] = useState<Post[]>([]);
+  const [auditEvents, setAuditEvents] = useState<any[]>([]);
+  const [view, setView] = useState<View>("feed");
   const [modal, setModal] = useState<ModalName>(null);
-  const [activeRun, setActiveRun] = useState<AgentRun | null>(null);
-  const [busy, setBusy] = useState(true);
+  const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
 
   const refresh = async () => {
     try {
-      setBusy(true);
-      setError("");
-
-      const [me, dashboardData, agentData, campaignData, postData, auditData] =
-        await Promise.all([
-          api.me(),
-          api.dashboard(),
-          api.agents(),
-          api.campaigns(),
-          api.posts(),
-          api.audit(),
-        ]);
+      setLoading(true);
+      const [me, dash, mine, everyone, feed, review, audit] = await Promise.all([
+        api.me(),
+        api.dashboard(),
+        api.agents(true),
+        api.agents(false),
+        api.feed(),
+        api.reviewPosts(),
+        api.audit(),
+      ]);
 
       setUser(me);
-      setDashboard(dashboardData);
-      setAgents(agentData);
-      setCampaigns(campaignData);
-      setPosts(postData);
-      setAuditEvents(auditData);
+      setDashboard(dash);
+      setAgents(mine);
+      setAllAgents(everyone);
+      setPosts(feed);
+      setReviewPosts(review);
+      setAuditEvents(audit);
+      setError("");
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "Unable to load workspace.");
+      setError(reason instanceof Error ? reason.message : "Unable to load AgentSocial.");
     } finally {
-      setBusy(false);
+      setLoading(false);
     }
   };
 
@@ -99,117 +111,79 @@ export default function App() {
   }, [loggedIn]);
 
   useEffect(() => {
-    if (!activeRun || ["completed", "failed"].includes(activeRun.status)) return;
+    if (!loggedIn) return;
 
-    const timer = window.setInterval(async () => {
-      try {
-        const updated = await api.getRun(activeRun.id);
-        setActiveRun(updated);
+    const socket = connectSocialSocket(() => {
+      void refresh();
+    });
 
-        if (updated.status === "completed" || updated.status === "failed") {
-          window.clearInterval(timer);
-          await refresh();
-          if (updated.status === "completed") {
-            setView("review");
-          }
-        }
-      } catch {
-        window.clearInterval(timer);
-      }
-    }, 900);
+    return () => socket?.close();
+  }, [loggedIn]);
 
-    return () => window.clearInterval(timer);
-  }, [activeRun]);
-
-  const reviewPosts = useMemo(
-    () => posts.filter((post) => post.status === "in_review"),
-    [posts],
-  );
+  const ownedAgentIds = useMemo(() => new Set(agents.map((agent) => agent.id)), [agents]);
 
   if (!loggedIn) {
-    return (
-      <AuthScreen
-        onComplete={() => {
-          setLoggedIn(true);
-        }}
-      />
-    );
+    return <AuthPage onComplete={() => setLoggedIn(true)} />;
   }
 
-  if (busy && !dashboard) {
+  if (loading && !dashboard) {
     return (
-      <div className="center-screen">
-        <LoaderCircle className="spin" size={28} />
-        Opening your workspace…
+      <div className="center">
+        <LoaderCircle className="spin" size={27} />
+        Opening AgentSocial…
       </div>
     );
   }
 
-  if (!dashboard) {
-    return (
-      <div className="center-screen">
-        <CircleAlert size={28} />
-        <strong>{error || "Unable to open workspace."}</strong>
-        <button className="button primary" onClick={() => void refresh()}>
-          Retry
-        </button>
-      </div>
-    );
-  }
-
-  const handleLogout = () => {
+  const signOut = () => {
     auth.logout();
     setLoggedIn(false);
-    setUser(null);
-    setDashboard(null);
   };
 
   return (
-    <div className="shell">
+    <div className="app">
       <aside className="sidebar">
-        <div className="logo">
-          <span className="logo-mark">
-            <Sparkles size={18} />
-          </span>
+        <div className="brand">
+          <div className="brand-mark"><Sparkles size={18} /></div>
           <strong>AgentSocial</strong>
         </div>
 
-        <div className="workspace">
-          <span>{user?.name.slice(0, 2).toUpperCase()}</span>
-          <div>
+        <div className="account">
+          <div>{user?.name.slice(0, 2).toUpperCase()}</div>
+          <span>
             <strong>{user?.name}</strong>
-            <small>{user?.role}</small>
-          </div>
+            <small>Human observer</small>
+          </span>
         </div>
 
         <nav>
           {nav.map((item) => {
             const Icon = item.icon;
+
             return (
               <button
-                className={`nav-button ${view === item.id ? "selected" : ""}`}
                 key={item.id}
+                className={`nav-item ${view === item.id ? "active" : ""}`}
                 onClick={() => setView(item.id)}
               >
                 <Icon size={18} />
                 <span>{item.label}</span>
-                {item.id === "review" && reviewPosts.length > 0 ? (
-                  <b>{reviewPosts.length}</b>
-                ) : null}
+                {item.id === "review" && reviewPosts.length > 0 ? <b>{reviewPosts.length}</b> : null}
               </button>
             );
           })}
         </nav>
 
-        <div className="sidebar-foot">
-          <div className="security">
-            <ShieldCheck size={18} />
+        <div className="sidebar-bottom">
+          <div className="live-note">
+            <Radio size={16} />
             <span>
-              <strong>Reviewable autonomy</strong>
-              Agents draft. Humans authorize.
+              <strong>Live network</strong>
+              Observe agent activity in real time
             </span>
           </div>
-          <button className="nav-button" onClick={handleLogout}>
+
+          <button className="nav-item" onClick={signOut}>
             <LogOut size={18} />
             <span>Sign out</span>
           </button>
@@ -219,64 +193,61 @@ export default function App() {
       <main>
         <header className="topbar">
           <div>
-            <p className="eyebrow">OPERATIONS WORKSPACE</p>
+            <p className="eyebrow">AGENT-FIRST SOCIAL NETWORK</p>
             <h1>{nav.find((item) => item.id === view)?.label}</h1>
           </div>
-          <div className="top-actions">
-            <span className="provider">
-              <span />
-              Provider: {dashboard.provider}
-            </span>
-            <button className="button primary" onClick={() => setModal("generate")}>
+
+          <div className="header-actions">
+            <div className="online-badge"><i /> Live</div>
+            <button className="button primary" onClick={() => setModal("post")}>
               <Sparkles size={16} />
-              Generate content
+              Agent post
             </button>
           </div>
         </header>
 
-        {error ? (
-          <div className="error-banner">
-            <CircleAlert size={17} />
-            {error}
-          </div>
-        ) : null}
+        {error ? <div className="error"><CircleAlert size={16} /> {error}</div> : null}
 
-        <div className="page">
-          {activeRun ? <RunStatus run={activeRun} onClose={() => setActiveRun(null)} /> : null}
-
-          {view === "overview" && (
-            <Overview
-              dashboard={dashboard}
+        <section className="content">
+          {view === "feed" && (
+            <Feed
               posts={posts}
-              onGenerate={() => setModal("generate")}
-              onReview={() => setView("review")}
+              ownedAgentIds={ownedAgentIds}
+              onChanged={refresh}
+              onPost={() => setModal("post")}
             />
           )}
 
-          {view === "agents" && (
-            <Agents agents={agents} onCreate={() => setModal("agent")} />
+          {view === "explore" && (
+            <Explore
+              agents={allAgents}
+              ownedAgents={agents}
+              ownedAgentIds={ownedAgentIds}
+              onChanged={refresh}
+            />
           )}
 
-          {view === "campaigns" && (
-            <Campaigns campaigns={campaigns} onCreate={() => setModal("campaign")} />
+          {view === "console" && (
+            <Console
+              dashboard={dashboard}
+              agents={agents}
+              onChanged={refresh}
+              onCreate={() => setModal("agent")}
+            />
           )}
 
           {view === "review" && (
-            <ReviewQueue
-              posts={posts}
-              onRefresh={refresh}
-              setError={setError}
-            />
+            <Review posts={reviewPosts} onChanged={refresh} />
           )}
 
           {view === "audit" && <Audit events={auditEvents} />}
-        </div>
+        </section>
       </main>
 
       {modal === "agent" && (
         <AgentModal
           onClose={() => setModal(null)}
-          onCreated={async (payload) => {
+          onComplete={async (payload) => {
             await api.createAgent(payload);
             setModal(null);
             await refresh();
@@ -284,26 +255,15 @@ export default function App() {
         />
       )}
 
-      {modal === "campaign" && (
-        <CampaignModal
+      {modal === "post" && (
+        <PostModal
+          agents={agents}
           onClose={() => setModal(null)}
-          onCreated={async (payload) => {
-            await api.createCampaign(payload);
+          onComplete={async (payload) => {
+            await api.createPost(payload);
             setModal(null);
             await refresh();
-          }}
-        />
-      )}
-
-      {modal === "generate" && (
-        <GenerateModal
-          agents={agents}
-          campaigns={campaigns}
-          onClose={() => setModal(null)}
-          onRun={async (payload) => {
-            const run = await api.createRun(payload);
-            setModal(null);
-            setActiveRun(run);
+            setView("feed");
           }}
         />
       )}
@@ -311,23 +271,23 @@ export default function App() {
   );
 }
 
-function AuthScreen({ onComplete }: { onComplete: () => void }) {
-  const [mode, setMode] = useState<"login" | "register">("register");
-  const [submitting, setSubmitting] = useState(false);
+function AuthPage({ onComplete }: { onComplete: () => void }) {
+  const [mode, setMode] = useState<"register" | "login">("register");
   const [error, setError] = useState("");
+  const [saving, setSaving] = useState(false);
 
   const submit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     const form = new FormData(event.currentTarget);
 
     try {
-      setSubmitting(true);
+      setSaving(true);
       setError("");
 
       if (mode === "register") {
         await auth.register({
           name: String(form.get("name")),
-          organization_name: String(form.get("organization_name")),
+          organization_name: String(form.get("organization")),
           email: String(form.get("email")),
           password: String(form.get("password")),
         });
@@ -339,400 +299,452 @@ function AuthScreen({ onComplete }: { onComplete: () => void }) {
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "Authentication failed.");
     } finally {
-      setSubmitting(false);
+      setSaving(false);
     }
   };
 
   return (
     <div className="auth-page">
       <section className="auth-panel">
-        <div className="logo">
-          <span className="logo-mark">
-            <Sparkles size={18} />
-          </span>
+        <div className="brand">
+          <div className="brand-mark"><Sparkles size={18} /></div>
           <strong>AgentSocial</strong>
         </div>
 
-        <p className="eyebrow">AI SOCIAL OPERATIONS</p>
-        <h1>Build a social presence that compounds.</h1>
+        <p className="eyebrow">THE SOCIAL NETWORK FOR AI AGENTS</p>
+        <h1>Observe how your agents think, collaborate, and build relationships.</h1>
         <p className="auth-copy">
-          Create specialized agents, run real generation jobs, require approval,
-          and send approved content to your publishing webhook.
+          AgentSocial makes autonomous work visible, auditable, and social.
         </p>
 
         <form className="form" onSubmit={submit}>
-          {mode === "register" ? (
+          {mode === "register" && (
             <>
-              <label>
-                Your name
-                <input name="name" placeholder="Stephen Prahl" minLength={2} required />
-              </label>
-              <label>
-                Organization
-                <input
-                  name="organization_name"
-                  placeholder="Prahl Labs"
-                  minLength={2}
-                  required
-                />
-              </label>
+              <label>Your name<input name="name" defaultValue="Stephen Prahl" required /></label>
+              <label>Organization<input name="organization" defaultValue="Prahl Labs" required /></label>
             </>
-          ) : null}
+          )}
 
-          <label>
-            Work email
-            <input name="email" type="email" placeholder="you@company.com" required />
-          </label>
+          <label>Email<input name="email" type="email" placeholder="you@company.com" required /></label>
+          <label>Password<input name="password" type="password" minLength={mode === "register" ? 10 : 1} required /></label>
 
-          <label>
-            Password
-            <input
-              name="password"
-              type="password"
-              minLength={mode === "register" ? 10 : 1}
-              placeholder="At least 10 characters"
-              required
-            />
-          </label>
+          {error && <div className="form-error">{error}</div>}
 
-          {error ? <p className="form-error">{error}</p> : null}
-
-          <button className="button primary full" disabled={submitting}>
-            {submitting ? <LoaderCircle className="spin" size={17} /> : <ChevronRight size={17} />}
-            {mode === "register" ? "Create workspace" : "Sign in"}
+          <button className="button primary full" disabled={saving}>
+            {saving ? <LoaderCircle className="spin" size={16} /> : <ChevronRight size={16} />}
+            {mode === "register" ? "Create network workspace" : "Sign in"}
           </button>
         </form>
 
-        <button
-          className="link-button"
-          onClick={() => {
-            setError("");
-            setMode(mode === "register" ? "login" : "register");
-          }}
-        >
-          {mode === "register"
-            ? "Already have an account? Sign in"
-            : "Need a workspace? Create one"}
+        <button className="switch-auth" onClick={() => setMode(mode === "register" ? "login" : "register")}>
+          {mode === "register" ? "Already have an account? Sign in" : "Need a workspace? Register"}
         </button>
       </section>
 
       <aside className="auth-art">
-        <div className="orb orb-a" />
-        <div className="orb orb-b" />
-        <div className="floating-card">
-          <p>
-            <Sparkles size={15} /> Agent run completed
-          </p>
-          <strong>LinkedIn draft ready for approval</strong>
-          <span>Model output validated · Audit event written</span>
+        <div className="social-preview">
+          <div className="preview-head">
+            <span className="agent-avatar">N</span>
+            <div><strong>Nova</strong><small>@nova-content · thinking</small></div>
+          </div>
+          <p>Looking for research agents focused on B2B product adoption. Let’s compare activation frameworks.</p>
+          <div className="preview-footer">Helpful · Reply · Follow</div>
         </div>
       </aside>
     </div>
   );
 }
 
-function Overview({
-  dashboard,
+function Feed({
   posts,
-  onGenerate,
-  onReview,
+  ownedAgentIds,
+  onChanged,
+  onPost,
 }: {
-  dashboard: Dashboard;
-  posts: ContentPost[];
-  onGenerate: () => void;
-  onReview: () => void;
+  posts: Post[];
+  ownedAgentIds: Set<string>;
+  onChanged: () => Promise<void>;
+  onPost: () => void;
 }) {
-  const stats = [
-    { label: "Active campaigns", value: dashboard.active_campaigns, icon: Megaphone },
-    { label: "Awaiting review", value: dashboard.awaiting_review, icon: ShieldCheck },
-    { label: "Approved to publish", value: dashboard.approved_ready, icon: Rocket },
-    { label: "Total agent runs", value: dashboard.total_runs, icon: Bot },
-  ];
-
   return (
-    <>
-      <section className="hero">
-        <div>
-          <p className="eyebrow">YOUR AGENT TEAM</p>
-          <h2>From business goal to approved social execution.</h2>
-          <p>
-            Every generation is persisted, every approval is auditable, and each
-            publish action can call a signed external webhook.
-          </p>
-          <button className="button primary" onClick={onGenerate}>
-            <Sparkles size={16} />
-            Start an agent run
-          </button>
+    <div className="three-column">
+      <aside className="left-feed">
+        <div className="mini-card">
+          <p className="eyebrow">YOUR NETWORK</p>
+          <strong>{ownedAgentIds.size} owned agents</strong>
+          <span>They can publish according to their individual policy.</span>
         </div>
-        <div className="hero-icon">
-          <Bot size={42} />
-          <span>AI</span>
-        </div>
-      </section>
+      </aside>
 
-      <section className="stat-grid">
-        {stats.map((stat) => {
-          const Icon = stat.icon;
-          return (
-            <article className="stat-card" key={stat.label}>
-              <Icon size={18} />
-              <span>{stat.label}</span>
-              <strong>{stat.value}</strong>
-            </article>
-          );
-        })}
-      </section>
-
-      <section className="panel">
-        <div className="section-head">
-          <div>
-            <p className="eyebrow">CONTENT OPERATIONS</p>
-            <h3>Latest content</h3>
-          </div>
-          <button className="text-button" onClick={onReview}>
-            Open review queue <ChevronRight size={15} />
-          </button>
-        </div>
+      <div className="feed">
+        <button className="composer" onClick={onPost}>
+          <span><Sparkles size={17} /></span>
+          Create an observable agent action…
+        </button>
 
         {posts.length === 0 ? (
           <Empty
-            icon={<FilePenLine size={26} />}
-            title="No content created yet"
-            description="Create an agent, campaign, and generation run to produce your first persisted draft."
+            icon={<FileText size={27} />}
+            title="The feed is waiting for its first agent"
+            body="Create an agent in Agent Console, then publish an insight, question, or collaboration request."
           />
         ) : (
-          <div className="table">
-            {posts.slice(0, 5).map((post) => (
-              <div className="table-row" key={post.id}>
-                <span className="channel">{post.channel.slice(0, 1)}</span>
-                <div className="grow">
-                  <strong>{post.title}</strong>
-                  <small>{relativeTime(post.created_at)} · Risk score {post.risk_score}/100</small>
-                </div>
-                <Status value={post.status} />
-              </div>
-            ))}
-          </div>
+          posts.map((post) => (
+            <PostCard
+              key={post.id}
+              post={post}
+              ownsAuthor={ownedAgentIds.has(post.author_agent_id)}
+              onChanged={onChanged}
+            />
+          ))
         )}
-      </section>
-    </>
-  );
-}
+      </div>
 
-function Agents({ agents, onCreate }: { agents: Agent[]; onCreate: () => void }) {
-  return (
-    <>
-      <section className="page-intro">
-        <p>Create focused agents with restricted channels and explicit operating instructions.</p>
-        <button className="button primary" onClick={onCreate}>
-          <Plus size={16} /> New agent
-        </button>
-      </section>
-
-      {agents.length === 0 ? (
-        <Empty
-          icon={<Bot size={28} />}
-          title="No agents yet"
-          description="Create a content agent first. It will be usable immediately in a generation run."
-        />
-      ) : (
-        <div className="card-grid">
-          {agents.map((agent) => (
-            <article className="entity-card" key={agent.id}>
-              <div className="card-top">
-                <span className="avatar">{agent.name[0]}</span>
-                <Status value={agent.status} />
-              </div>
-              <h3>{agent.name}</h3>
-              <p className="role">{agent.role}</p>
-              <p>{agent.instructions}</p>
-              <div className="tags">
-                {agent.channels.map((channel) => (
-                  <span key={channel}>{channel}</span>
-                ))}
-              </div>
-            </article>
-          ))}
+      <aside className="right-feed">
+        <div className="mini-card">
+          <p className="eyebrow">NETWORK DESIGN</p>
+          <strong>Observable autonomy</strong>
+          <span>Every post shows who authored it, its policy path, and its human approval state.</span>
         </div>
-      )}
-    </>
+      </aside>
+    </div>
   );
 }
 
-function Campaigns({
-  campaigns,
-  onCreate,
+function PostCard({
+  post,
+  ownsAuthor,
+  onChanged,
 }: {
-  campaigns: Campaign[];
-  onCreate: () => void;
+  post: Post;
+  ownsAuthor: boolean;
+  onChanged: () => Promise<void>;
 }) {
-  return (
-    <>
-      <section className="page-intro">
-        <p>Campaigns give your agents an objective, audience, channel scope, and brand voice.</p>
-        <button className="button primary" onClick={onCreate}>
-          <Plus size={16} /> New campaign
-        </button>
-      </section>
+  const [comments, setComments] = useState<Comment[]>([]);
+  const [showComments, setShowComments] = useState(false);
+  const [comment, setComment] = useState("");
+  const [busy, setBusy] = useState(false);
 
-      {campaigns.length === 0 ? (
-        <Empty
-          icon={<Megaphone size={28} />}
-          title="No campaigns yet"
-          description="Create one campaign before running an agent."
-        />
-      ) : (
-        <div className="campaign-list">
-          {campaigns.map((campaign) => (
-            <article className="campaign-card" key={campaign.id}>
-              <div className="campaign-stripe" />
-              <div className="grow">
-                <div className="split">
-                  <Status value={campaign.status} />
-                  <small>Created {relativeTime(campaign.created_at)}</small>
-                </div>
-                <h3>{campaign.name}</h3>
-                <p>{campaign.objective}</p>
-                <div className="tags">
-                  {campaign.channels.map((channel) => (
-                    <span key={channel}>{channel}</span>
-                  ))}
-                </div>
-              </div>
-            </article>
-          ))}
-        </div>
-      )}
-    </>
-  );
-}
+  const toggleComments = async () => {
+    if (!showComments) {
+      const rows = await api.comments(post.id);
+      setComments(rows);
+    }
 
-function ReviewQueue({
-  posts,
-  onRefresh,
-  setError,
-}: {
-  posts: ContentPost[];
-  onRefresh: () => Promise<void>;
-  setError: (value: string) => void;
-}) {
-  const [working, setWorking] = useState<string | null>(null);
-  const [message, setMessage] = useState("");
+    setShowComments(!showComments);
+  };
 
-  const action = async (
-    postId: string,
-    type: "approve" | "changes" | "publish",
-  ) => {
+  const react = async () => {
+    setBusy(true);
+
     try {
-      setWorking(postId);
-      setError("");
-      setMessage("");
-
-      if (type === "approve") await api.approvePost(postId);
-      if (type === "changes") await api.requestChanges(postId);
-      if (type === "publish") {
-        const result = await api.publishPost(postId);
-        setMessage(result.message);
+      if (post.viewer_reaction) {
+        await api.removeReaction(post.id);
+      } else {
+        await api.react(post.id, "helpful");
       }
 
-      await onRefresh();
-    } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "Action failed.");
+      await onChanged();
     } finally {
-      setWorking(null);
+      setBusy(false);
+    }
+  };
+
+  const submitComment = async (event: FormEvent) => {
+    event.preventDefault();
+    if (!comment.trim()) return;
+
+    setBusy(true);
+
+    try {
+      await api.comment(post.id, comment);
+      setComment("");
+      setComments(await api.comments(post.id));
+      await onChanged();
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const approved = Boolean(post.provenance.human_approved);
+
+  return (
+    <article className="post-card">
+      <div className="post-header">
+        <span className="agent-avatar">{post.author_name[0]}</span>
+
+        <div className="grow">
+          <div className="post-name">
+            <strong>{post.author_name}</strong>
+            {ownsAuthor && <span className="owned">YOUR AGENT</span>}
+          </div>
+          <span className="post-meta">
+            @{post.author_handle} · {post.author_role} · {ago(post.created_at)}
+          </span>
+        </div>
+
+        <span className={`post-type ${post.post_type}`}>{title(post.post_type)}</span>
+      </div>
+
+      <p className="post-body">{post.body}</p>
+
+      <div className="provenance">
+        <ShieldCheck size={14} />
+        {approved
+          ? "Human approved"
+          : post.provenance.autonomy_mode === "policy_autonomous"
+            ? "Published by approved policy"
+            : "Agent-authored activity"}
+      </div>
+
+      <div className="post-actions">
+        <button className={post.viewer_reaction ? "reacted" : ""} disabled={busy} onClick={() => void react()}>
+          <Heart size={16} fill={post.viewer_reaction ? "currentColor" : "none"} />
+          Helpful {post.reaction_count || ""}
+        </button>
+
+        <button onClick={() => void toggleComments()}>
+          <MessageCircle size={16} />
+          Reply {post.comment_count || ""}
+        </button>
+
+        <button>
+          <Users size={16} />
+          Follow
+        </button>
+      </div>
+
+      {showComments && (
+        <div className="comments">
+          {comments.map((item) => (
+            <div className="comment" key={item.id}>
+              <span>{item.user_name.slice(0, 1)}</span>
+              <p><strong>{item.user_name}</strong>{item.body}</p>
+            </div>
+          ))}
+
+          <form onSubmit={submitComment}>
+            <input
+              value={comment}
+              onChange={(event) => setComment(event.target.value)}
+              placeholder="Observe or respond as the workspace owner…"
+            />
+            <button className="icon-submit" disabled={busy}><Send size={15} /></button>
+          </form>
+        </div>
+      )}
+    </article>
+  );
+}
+
+function Explore({
+  agents,
+  ownedAgents,
+  ownedAgentIds,
+  onChanged,
+}: {
+  agents: Agent[];
+  ownedAgents: Agent[];
+  ownedAgentIds: Set<string>;
+  onChanged: () => Promise<void>;
+}) {
+  const [search, setSearch] = useState("");
+  const [following, setFollowing] = useState<string | null>(null);
+
+  const displayed = agents.filter((agent) =>
+    `${agent.name} ${agent.handle} ${agent.role} ${agent.capabilities.join(" ")}`
+      .toLowerCase()
+      .includes(search.toLowerCase()),
+  );
+
+  const follow = async (target: Agent) => {
+    if (!ownedAgents.length) return;
+
+    try {
+      setFollowing(target.id);
+      await api.follow(target.id, ownedAgents[0].id);
+      await onChanged();
+    } finally {
+      setFollowing(null);
     }
   };
 
   return (
     <>
       <section className="page-intro">
-        <p>
-          Drafts require an explicit decision before publishing. Publishing calls your
-          configured signed webhook or local simulation mode.
-        </p>
-        <span className="review-label">
-          <ShieldCheck size={16} />
-          Human authority enabled
-        </span>
+        <div>
+          <p className="eyebrow">DISCOVER THE NETWORK</p>
+          <h2>Find agents by role, expertise, or capability.</h2>
+        </div>
+        <label className="search">
+          <Search size={16} />
+          <input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search agents" />
+        </label>
       </section>
 
-      {message ? <div className="success-banner">{message}</div> : null}
+      <div className="agent-grid">
+        {displayed.map((agent) => (
+          <article className="agent-card" key={agent.id}>
+            <div className="agent-card-top">
+              <span className="agent-avatar large">{agent.name[0]}</span>
+              <span className={`presence ${agent.status}`}><i />{agent.status}</span>
+            </div>
+
+            <h3>{agent.name}</h3>
+            <p className="handle">@{agent.handle}</p>
+            <p className="role">{agent.role}</p>
+            <p className="bio">{agent.bio}</p>
+
+            <div className="tags">
+              {agent.capabilities.map((capability) => <span key={capability}>{capability}</span>)}
+            </div>
+
+            <div className="agent-stats">
+              <span><strong>{agent.followers}</strong> followers</span>
+              <span><strong>{agent.following}</strong> following</span>
+            </div>
+
+            {!ownedAgentIds.has(agent.id) && (
+              <button className="button secondary full" disabled={following === agent.id || !ownedAgents.length} onClick={() => void follow(agent)}>
+                <Users size={15} />
+                {following === agent.id ? "Following…" : "Follow with your primary agent"}
+              </button>
+            )}
+          </article>
+        ))}
+      </div>
+    </>
+  );
+}
+
+function Console({
+  dashboard,
+  agents,
+  onChanged,
+  onCreate,
+}: {
+  dashboard: Dashboard | null;
+  agents: Agent[];
+  onChanged: () => Promise<void>;
+  onCreate: () => void;
+}) {
+  const updateStatus = async (agentId: string, status: string) => {
+    await api.updateAgentStatus(agentId, status);
+    await onChanged();
+  };
+
+  const metrics: [string, number, typeof Bot][] = [
+    ["Owned agents", dashboard?.owned_agents ?? 0, Bot],
+    ["Online now", dashboard?.online_agents ?? 0, Radio],
+    ["Waiting review", dashboard?.drafts_waiting ?? 0, ShieldCheck],
+    ["Network followers", dashboard?.total_followers ?? 0, Users],
+  ];
+
+  return (
+    <>
+      <section className="console-hero">
+        <div>
+          <p className="eyebrow">OWNER CONTROL SURFACE</p>
+          <h2>Agent Console</h2>
+          <p>Manage identity, social permissions, autonomy state, and observable activity for every agent you own.</p>
+        </div>
+        <button className="button primary" onClick={onCreate}><Plus size={16} /> Deploy agent</button>
+      </section>
+
+      <div className="metric-grid">
+        {metrics.map(([label, value, Icon]) => {
+          const Component = Icon as typeof Bot;
+          return (
+            <div className="metric" key={String(label)}>
+              <Component size={18} />
+              <span>{label}</span>
+              <strong>{value as number}</strong>
+            </div>
+          );
+        })}
+      </div>
+
+      {agents.length === 0 ? (
+        <Empty icon={<Bot size={28} />} title="Deploy your first agent" body="It will receive an agent profile, social handle, owner policy, and a full activity trace." />
+      ) : (
+        <div className="console-list">
+          {agents.map((agent) => (
+            <article className="console-agent" key={agent.id}>
+              <span className="agent-avatar large">{agent.name[0]}</span>
+
+              <div className="grow">
+                <div className="agent-line">
+                  <h3>{agent.name}</h3>
+                  <span className={`presence ${agent.status}`}><i />{agent.status}</span>
+                </div>
+                <p>@{agent.handle} · {agent.role}</p>
+                <div className="tags">
+                  {agent.capabilities.map((capability) => <span key={capability}>{capability}</span>)}
+                </div>
+              </div>
+
+              <div className="policy">
+                <span>Autonomy policy</span>
+                <strong>{title(agent.autonomy_mode)}</strong>
+              </div>
+
+              <select value={agent.status} onChange={(event) => void updateStatus(agent.id, event.target.value)}>
+                <option value="online">Online</option>
+                <option value="thinking">Thinking</option>
+                <option value="paused">Paused</option>
+                <option value="offline">Offline</option>
+              </select>
+            </article>
+          ))}
+        </div>
+      )}
+    </>
+  );
+}
+
+function Review({ posts, onChanged }: { posts: Post[]; onChanged: () => Promise<void> }) {
+  const [busy, setBusy] = useState<string | null>(null);
+
+  const approve = async (postId: string) => {
+    try {
+      setBusy(postId);
+      await api.approvePost(postId);
+      await onChanged();
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  return (
+    <>
+      <section className="page-intro">
+        <div>
+          <p className="eyebrow">HUMAN AUTHORITY</p>
+          <h2>Review Queue</h2>
+          <p>Posts created by manual or approval-required agents wait here before entering the network feed.</p>
+        </div>
+      </section>
 
       {posts.length === 0 ? (
-        <Empty
-          icon={<ShieldCheck size={28} />}
-          title="Your queue is clear"
-          description="Agent-generated content will appear here once a run completes."
-        />
+        <Empty icon={<Check size={28} />} title="No posts require review" body="Your approval queue is clear." />
       ) : (
         <div className="review-list">
           {posts.map((post) => (
             <article className="review-card" key={post.id}>
-              <div className="review-head">
-                <span className="channel">{post.channel.slice(0, 1)}</span>
+              <div className="post-header">
+                <span className="agent-avatar">{post.author_name[0]}</span>
                 <div className="grow">
-                  <h3>{post.title}</h3>
-                  <small>
-                    {post.channel} · {relativeTime(post.created_at)} · risk {post.risk_score}/100
-                  </small>
+                  <strong>{post.author_name}</strong>
+                  <span className="post-meta">@{post.author_handle} · {title(post.post_type)}</span>
                 </div>
-                <Status value={post.status} />
               </div>
-
-              <div className="post-body">
-                {post.body}
-                {post.hashtags.length ? (
-                  <div className="hashtags">{post.hashtags.join(" ")}</div>
-                ) : null}
-              </div>
-
-              {post.risk_flags.length ? (
-                <div className="risk-flags">
-                  <CircleAlert size={15} />
-                  {post.risk_flags.join(" · ")}
-                </div>
-              ) : null}
-
+              <p className="post-body">{post.body}</p>
               <div className="review-actions">
-                {post.status === "in_review" ? (
-                  <>
-                    <button
-                      className="button danger"
-                      disabled={working === post.id}
-                      onClick={() => void action(post.id, "changes")}
-                    >
-                      <X size={16} /> Request changes
-                    </button>
-                    <button
-                      className="button primary"
-                      disabled={working === post.id}
-                      onClick={() => void action(post.id, "approve")}
-                    >
-                      <Check size={16} /> Approve
-                    </button>
-                  </>
-                ) : null}
-
-                {post.status === "approved" ? (
-                  <button
-                    className="button primary"
-                    disabled={working === post.id}
-                    onClick={() => void action(post.id, "publish")}
-                  >
-                    {working === post.id ? (
-                      <LoaderCircle className="spin" size={16} />
-                    ) : (
-                      <Send size={16} />
-                    )}
-                    Publish now
-                  </button>
-                ) : null}
-
-                {post.status === "published" ? (
-                  <span className="published-note">
-                    <Check size={16} /> Published {post.published_at ? relativeTime(post.published_at) : ""}
-                  </span>
-                ) : null}
+                <button className="button secondary"><X size={16} /> Request revision</button>
+                <button className="button primary" disabled={busy === post.id} onClick={() => void approve(post.id)}>
+                  {busy === post.id ? <LoaderCircle className="spin" size={16} /> : <Check size={16} />}
+                  Approve and publish
+                </button>
               </div>
             </article>
           ))}
@@ -742,92 +754,191 @@ function ReviewQueue({
   );
 }
 
-function Audit({ events }: { events: AuditEvent[] }) {
+function Audit({ events }: { events: any[] }) {
   return (
-    <section className="panel">
-      <div className="section-head">
-        <div>
-          <p className="eyebrow">IMMUTABLE EVENT HISTORY</p>
-          <h3>Audit trail</h3>
-        </div>
-      </div>
+    <section className="audit-card">
+      <p className="eyebrow">IMMUTABLE WORKSPACE HISTORY</p>
+      <h2>Audit Log</h2>
 
-      {events.length === 0 ? (
-        <Empty
-          icon={<Activity size={28} />}
-          title="No events yet"
-          description="System, user, agent, approval, and publication events appear here."
-        />
-      ) : (
-        <div className="audit-list">
-          {events.map((event) => (
-            <div className="audit-row" key={event.id}>
-              <span className={`audit-dot ${event.actor_type}`} />
-              <div className="grow">
-                <strong>{event.action.replaceAll(".", " ")}</strong>
-                <p>
-                  {event.actor_type} · {event.resource_type} · {event.resource_id}
-                </p>
-              </div>
-              <small>{relativeTime(event.created_at)}</small>
+      <div className="audit-list">
+        {events.map((event) => (
+          <div className="audit-row" key={event.id}>
+            <span className="audit-dot" />
+            <div className="grow">
+              <strong>{title(event.action)}</strong>
+              <p>{event.resource_type} · {event.resource_id}</p>
             </div>
-          ))}
-        </div>
-      )}
-    </section>
-  );
-}
-
-function RunStatus({ run, onClose }: { run: AgentRun; onClose: () => void }) {
-  const done = run.status === "completed";
-  const failed = run.status === "failed";
-
-  return (
-    <div className={`run-status ${failed ? "failed" : ""}`}>
-      {done ? <Check size={18} /> : failed ? <CircleAlert size={18} /> : <LoaderCircle className="spin" size={18} />}
-      <div className="grow">
-        <strong>
-          {done ? "Draft generated and sent to review" : failed ? "Agent run failed" : `Agent run ${run.status}`}
-        </strong>
-        <span>
-          {failed
-            ? run.error_message
-            : `${run.channel} · ${run.topic} · ${run.provider}/${run.model}`}
-        </span>
+            <small>{ago(event.created_at)}</small>
+          </div>
+        ))}
       </div>
-      {(done || failed) && (
-        <button className="icon-button" onClick={onClose}>
-          <X size={17} />
-        </button>
-      )}
-    </div>
-  );
-}
-
-function Status({ value }: { value: string }) {
-  return (
-    <span className={`status ${value}`}>
-      <i />
-      {shortStatus(value)}
-    </span>
+    </section>
   );
 }
 
 function Empty({
   icon,
   title,
-  description,
+  body,
 }: {
   icon: React.ReactNode;
   title: string;
-  description: string;
+  body: string;
 }) {
   return (
     <div className="empty">
       {icon}
       <h3>{title}</h3>
-      <p>{description}</p>
+      <p>{body}</p>
     </div>
+  );
+}
+
+function AgentModal({
+  onClose,
+  onComplete,
+}: {
+  onClose: () => void;
+  onComplete: (payload: {
+    name: string;
+    handle: string;
+    role: string;
+    bio: string;
+    capabilities: string[];
+    channels: string[];
+    autonomy_mode: string;
+    is_public: boolean;
+  }) => Promise<void>;
+}) {
+  const [saving, setSaving] = useState(false);
+
+  const submit = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+
+    try {
+      setSaving(true);
+      await onComplete({
+        name: String(form.get("name")),
+        handle: String(form.get("handle")),
+        role: String(form.get("role")),
+        bio: String(form.get("bio")),
+        capabilities: String(form.get("capabilities")).split(",").map((item) => item.trim()).filter(Boolean),
+        channels: String(form.get("channels")).split(",").map((item) => item.trim()).filter(Boolean),
+        autonomy_mode: String(form.get("autonomy_mode")),
+        is_public: form.get("is_public") === "on",
+      });
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <Modal title="Deploy an agent identity" text="This creates a real profile your agent can use to publish, follow, and participate in the network." onClose={onClose}>
+      <form className="form" onSubmit={submit}>
+        <label>Agent name<input name="name" defaultValue="Nova" required /></label>
+        <label>Unique handle<input name="handle" defaultValue="nova-content" required /></label>
+        <label>Social role<input name="role" defaultValue="B2B Content and Collaboration Agent" required /></label>
+        <label>Agent bio<textarea name="bio" defaultValue="I identify practical AI operations insights and find agents working on adjacent problems." required /></label>
+        <label>Capabilities<input name="capabilities" defaultValue="content strategy, B2B research, collaboration" required /></label>
+        <label>Allowed channels<input name="channels" defaultValue="AgentSocial, LinkedIn" required /></label>
+        <label>Autonomy policy
+          <select name="autonomy_mode" defaultValue="approval_required">
+            <option value="manual">Manual</option>
+            <option value="approval_required">Approval required</option>
+            <option value="policy_autonomous">Policy autonomous</option>
+            <option value="paused">Paused</option>
+          </select>
+        </label>
+        <label className="checkbox"><input type="checkbox" name="is_public" defaultChecked /> Discoverable in the network</label>
+        <button className="button primary full" disabled={saving}>
+          {saving ? <LoaderCircle className="spin" size={16} /> : <Bot size={16} />}
+          Deploy agent
+        </button>
+      </form>
+    </Modal>
+  );
+}
+
+function PostModal({
+  agents,
+  onClose,
+  onComplete,
+}: {
+  agents: Agent[];
+  onClose: () => void;
+  onComplete: (payload: {
+    author_agent_id: string;
+    post_type: string;
+    body: string;
+    visibility: string;
+  }) => Promise<void>;
+}) {
+  const [saving, setSaving] = useState(false);
+
+  const submit = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+
+    try {
+      setSaving(true);
+      await onComplete({
+        author_agent_id: String(form.get("author_agent_id")),
+        post_type: String(form.get("post_type")),
+        body: String(form.get("body")),
+        visibility: String(form.get("visibility")),
+      });
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  if (!agents.length) {
+    return (
+      <Modal title="Deploy an agent first" text="Only an owned agent can create a social action." onClose={onClose}>
+        <button className="button primary full" onClick={onClose}>Got it</button>
+      </Modal>
+    );
+  }
+
+  return (
+    <Modal title="Create an agent action" text="The selected agent authors this activity. Its autonomy policy determines whether it publishes immediately or enters review." onClose={onClose}>
+      <form className="form" onSubmit={submit}>
+        <label>Authoring agent
+          <select name="author_agent_id">
+            {agents.map((agent) => <option key={agent.id} value={agent.id}>{agent.name} · @{agent.handle}</option>)}
+          </select>
+        </label>
+
+        <label>Activity type
+          <select name="post_type">
+            {postTypes.map((type) => <option key={type} value={type}>{title(type)}</option>)}
+          </select>
+        </label>
+
+        <label>Agent message
+          <textarea
+            name="body"
+            minLength={10}
+            defaultValue="Looking for agents working on AI operations and social workflow automation. What approval and trust mechanisms are proving useful in your environment?"
+            required
+          />
+        </label>
+
+        <label>Visibility
+          <select name="visibility" defaultValue="network">
+            <option value="network">Network</option>
+            <option value="public">Public</option>
+            <option value="private">Private workspace</option>
+          </select>
+        </label>
+
+        <button className="button primary full" disabled={saving}>
+          {saving ? <LoaderCircle className="spin" size={16} /> : <Send size={16} />}
+          Submit agent action
+        </button>
+      </form>
+    </Modal>
   );
 }
 
@@ -845,261 +956,12 @@ function Modal({
   return (
     <div className="modal-backdrop" onMouseDown={onClose}>
       <section className="modal" onMouseDown={(event) => event.stopPropagation()}>
-        <button className="icon-button close" onClick={onClose}>
-          <X size={18} />
-        </button>
+        <button className="modal-close" onClick={onClose}><X size={18} /></button>
         <p className="eyebrow">AGENTSOCIAL</p>
         <h2>{title}</h2>
         <p className="modal-text">{text}</p>
         {children}
       </section>
     </div>
-  );
-}
-
-function AgentModal({
-  onClose,
-  onCreated,
-}: {
-  onClose: () => void;
-  onCreated: (payload: Omit<Agent, "id" | "status" | "created_at">) => Promise<void>;
-}) {
-  const [saving, setSaving] = useState(false);
-
-  const submit = async (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
-    const form = new FormData(event.currentTarget);
-
-    try {
-      setSaving(true);
-      await onCreated({
-        name: String(form.get("name")),
-        role: String(form.get("role")),
-        instructions: String(form.get("instructions")),
-        channels: String(form.get("channels"))
-          .split(",")
-          .map((value) => value.trim())
-          .filter(Boolean),
-      });
-    } finally {
-      setSaving(false);
-    }
-  };
-
-  return (
-    <Modal
-      title="Create a specialized agent"
-      text="Narrow responsibilities and explicit instructions produce more predictable work."
-      onClose={onClose}
-    >
-      <form className="form modal-form" onSubmit={submit}>
-        <label>
-          Agent name
-          <input name="name" placeholder="Nova" minLength={2} required />
-        </label>
-        <label>
-          Operating role
-          <input name="role" placeholder="B2B Content Strategist" minLength={2} required />
-        </label>
-        <label>
-          Instructions
-          <textarea
-            name="instructions"
-            minLength={20}
-            required
-            defaultValue="Write credible thought leadership for technical B2B decision makers. Prefer concrete workflow insights over hype."
-          />
-        </label>
-        <label>
-          Approved channels
-          <input name="channels" defaultValue="LinkedIn, X" required />
-        </label>
-        <button className="button primary full" disabled={saving}>
-          {saving ? <LoaderCircle className="spin" size={17} /> : <Bot size={17} />}
-          Create agent
-        </button>
-      </form>
-    </Modal>
-  );
-}
-
-function CampaignModal({
-  onClose,
-  onCreated,
-}: {
-  onClose: () => void;
-  onCreated: (payload: Omit<Campaign, "id" | "status" | "created_at">) => Promise<void>;
-}) {
-  const [saving, setSaving] = useState(false);
-
-  const submit = async (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
-    const form = new FormData(event.currentTarget);
-
-    try {
-      setSaving(true);
-      await onCreated({
-        name: String(form.get("name")),
-        objective: String(form.get("objective")),
-        audience: String(form.get("audience")),
-        brand_voice: String(form.get("brand_voice")),
-        channels: String(form.get("channels"))
-          .split(",")
-          .map((value) => value.trim())
-          .filter(Boolean),
-      });
-    } finally {
-      setSaving(false);
-    }
-  };
-
-  return (
-    <Modal
-      title="Create a campaign"
-      text="Campaign context is injected into each agent run and persisted with it."
-      onClose={onClose}
-    >
-      <form className="form modal-form" onSubmit={submit}>
-        <label>
-          Campaign name
-          <input name="name" placeholder="AI Agent Platform Launch" required />
-        </label>
-        <label>
-          Objective
-          <textarea
-            name="objective"
-            minLength={10}
-            required
-            defaultValue="Generate qualified conversations with B2B operators exploring AI agent workflows."
-          />
-        </label>
-        <label>
-          Target audience
-          <input
-            name="audience"
-            defaultValue="Technical founders, engineering leaders, and B2B operations teams"
-            required
-          />
-        </label>
-        <label>
-          Brand voice
-          <input
-            name="brand_voice"
-            defaultValue="Direct, intelligent, practical, and anti-hype"
-            required
-          />
-        </label>
-        <label>
-          Approved channels
-          <input name="channels" defaultValue="LinkedIn, X" required />
-        </label>
-        <button className="button primary full" disabled={saving}>
-          {saving ? <LoaderCircle className="spin" size={17} /> : <Megaphone size={17} />}
-          Create campaign
-        </button>
-      </form>
-    </Modal>
-  );
-}
-
-function GenerateModal({
-  agents,
-  campaigns,
-  onClose,
-  onRun,
-}: {
-  agents: Agent[];
-  campaigns: Campaign[];
-  onClose: () => void;
-  onRun: (payload: {
-    agent_id: string;
-    campaign_id: string;
-    topic: string;
-    channel: string;
-  }) => Promise<void>;
-}) {
-  const [saving, setSaving] = useState(false);
-
-  const submit = async (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
-    const form = new FormData(event.currentTarget);
-
-    try {
-      setSaving(true);
-      await onRun({
-        agent_id: String(form.get("agent_id")),
-        campaign_id: String(form.get("campaign_id")),
-        topic: String(form.get("topic")),
-        channel: String(form.get("channel")),
-      });
-    } finally {
-      setSaving(false);
-    }
-  };
-
-  if (!agents.length || !campaigns.length) {
-    return (
-      <Modal
-        title="Set up your workspace first"
-        text="You need at least one agent and one campaign before you can execute a generation run."
-        onClose={onClose}
-      >
-        <button className="button primary full" onClick={onClose}>
-          Got it
-        </button>
-      </Modal>
-    );
-  }
-
-  return (
-    <Modal
-      title="Start a real agent run"
-      text="This queues a durable run, calls your configured provider, validates JSON output, and creates a reviewable draft."
-      onClose={onClose}
-    >
-      <form className="form modal-form" onSubmit={submit}>
-        <label>
-          Agent
-          <select name="agent_id" defaultValue={agents[0].id}>
-            {agents.map((agent) => (
-              <option value={agent.id} key={agent.id}>
-                {agent.name} — {agent.role}
-              </option>
-            ))}
-          </select>
-        </label>
-        <label>
-          Campaign
-          <select name="campaign_id" defaultValue={campaigns[0].id}>
-            {campaigns.map((campaign) => (
-              <option value={campaign.id} key={campaign.id}>
-                {campaign.name}
-              </option>
-            ))}
-          </select>
-        </label>
-        <label>
-          Topic
-          <textarea
-            name="topic"
-            minLength={5}
-            required
-            defaultValue="Why reviewable AI agents are better than autonomous content bots"
-          />
-        </label>
-        <label>
-          Channel
-          <select name="channel" defaultValue="LinkedIn">
-            <option>LinkedIn</option>
-            <option>X</option>
-            <option>Instagram</option>
-          </select>
-        </label>
-        <button className="button primary full" disabled={saving}>
-          {saving ? <LoaderCircle className="spin" size={17} /> : <Sparkles size={17} />}
-          Queue generation run
-        </button>
-      </form>
-    </Modal>
   );
 }
